@@ -53,6 +53,10 @@ var lod: Lod
 var size: float  # tile edge in true metres
 var latitude: float
 var _mvt_bytes: PackedByteArray
+var _neighbour_bytes := {}  # Vector2i offset -> PackedByteArray (8 surrounding tiles)
+## Bridge/tunnel lines from the surrounding tiles, in this chunk's space:
+## {pts, kind, cls, layer}. Lets structures be chained and profiled across seams.
+var _neighbour_structures: Array[Dictionary] = []
 var _elev: ElevationSource
 var _merc0: PackedFloat64Array  # tile NW corner, mercator
 var _scale: float
@@ -81,16 +85,30 @@ var collision := {}  # {heights: PackedFloat32Array, width: int, cell: float}
 var water := {}
 var roads := {}
 var road_spawn: Array[Dictionary] = []  # {pts: PackedVector3Array, rank: int}
-var bridge_faces := PackedVector3Array()
+## Collision faces for bridge decks/railings and tunnel floors/walls.
+var structure_faces := PackedVector3Array()
+## Concrete for bridge slabs, railings, pillars and tunnel tubes (building shader, no windows).
+var structures := {}
+## Tunnel volumes in chunk space; each maps the unit cube [-1, 1]^3 onto a box. While
+## the car is inside one, terrain collision is off. `portal_boxes` is the subset where
+## the tube meets the surface, which the terrain shader cuts away.
+var tunnel_boxes: Array[Transform3D] = []
+var portal_boxes: Array[Transform3D] = []
+## Terrain triangles (terrain physics layer) re-added around tunnel portals, where the
+## heightmap collision has holes so cars can drive into the tube.
+var terrain_patch_faces := PackedVector3Array()
+var _tunnel_segments: Array[Dictionary] = []  # {a, b: Vector2, ha, hb: road heights, wall}
 var buildings := {}
 var building_faces: Array[PackedVector3Array] = []  # per scatter block, for incremental upload
 var scatter: Array[Dictionary] = []  # per block: {role: Array[Transform3D]}
 
 
-func _init(p_tile: Vector2i, p_lod: Lod, mvt: PackedByteArray, elev: ElevationSource) -> void:
+func _init(p_tile: Vector2i, p_lod: Lod, mvt: PackedByteArray, elev: ElevationSource,
+		neighbours := {}) -> void:
 	tile = p_tile
 	lod = p_lod
 	_mvt_bytes = mvt
+	_neighbour_bytes = neighbours
 	_elev = elev
 	_scale = Geo.scale
 	_merc0 = Geo.tile_origin_merc(tile, Geo.CHUNK_ZOOM)
@@ -132,6 +150,28 @@ func _decode() -> void:
 	if not _mvt_bytes.is_empty():
 		_layers = MVTDecoder.decode(_mvt_bytes, LAYERS)
 	_mvt_bytes = PackedByteArray()
+	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
+	for offset: Vector2i in _neighbour_bytes:
+		var bytes: PackedByteArray = _neighbour_bytes[offset]
+		if bytes.is_empty():
+			continue
+		var layer: Dictionary = MVTDecoder.decode(bytes, ["transportation"]).get("transportation", {})
+		if layer.is_empty():
+			continue
+		var k := size / float(layer.extent)
+		var shift := Vector2(offset) * size
+		for f: Dictionary in layer.features:
+			var brunnel := str(f.tags.get("brunnel", ""))
+			var c := str(f.tags.get("class", ""))
+			if not (brunnel == "bridge" or brunnel == "tunnel") or not ROADS.has(c) or f.type != MVTDecoder.GEOM_LINE:
+				continue
+			var layer_tag := int(f.tags.get("layer", 1 if brunnel == "bridge" else 0))
+			for r: PackedVector2Array in f.rings:
+				# Only that tile's own part (its buffer overlaps ours and other neighbours).
+				for piece: PackedVector2Array in Geometry2D.intersect_polyline_with_polygon(_scale_ring(r, k), rect):
+					_neighbour_structures.append({pts = _translate(piece, shift), kind = brunnel,
+						cls = c, layer = layer_tag})
+	_neighbour_bytes = {}
 
 
 func _features(layer: String) -> Array:
@@ -209,23 +249,254 @@ func _classify() -> void:
 			Raster.fill_polygon(_mask, MASK_RES, MASK_RES, mask_cell, r, 2)
 	# Roads: clip to the tile so neighbouring chunks don't draw the same piece twice.
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
+	var structures_by_key := {}  # "kind|class|layer" -> Array[PackedVector2Array]
+	var add_road := func(r: PackedVector2Array, c: String) -> void:
+		if ROADS[c][1] >= DRIVABLE_RANK:
+			_flatten_lines.append({pts = r, cls = c})
+		for piece: PackedVector2Array in Geometry2D.intersect_polyline_with_polygon(r, rect):
+			if piece.size() >= 2:
+				_road_lines.append({pts = piece, cls = c, bridge = false, tunnel = false})
+				Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, piece,
+					ROADS[c][0] + 1.5, 3)
 	for f: Dictionary in _features("transportation"):
 		var c := str(f.tags.get("class", ""))
 		if not ROADS.has(c) or f.type != MVTDecoder.GEOM_LINE:
 			continue
 		var brunnel := str(f.tags.get("brunnel", ""))
-		if brunnel == "tunnel":
+		if brunnel == "bridge" or brunnel == "tunnel":
+			var layer := int(f.tags.get("layer", 1 if brunnel == "bridge" else 0))
+			var key := "%s|%s|%d" % [brunnel, c, layer]
+			if not structures_by_key.has(key):
+				structures_by_key[key] = []
+			for r in _feature_rings("transportation", f):
+				structures_by_key[key].append_array(Geometry2D.intersect_polyline_with_polygon(r, rect))
 			continue
 		for r in _feature_rings("transportation", f):
-			if brunnel != "bridge" and ROADS[c][1] >= DRIVABLE_RANK:
-				_flatten_lines.append({pts = r, cls = c})
-			for piece: PackedVector2Array in Geometry2D.intersect_polyline_with_polygon(r, rect):
-				if piece.size() >= 2:
-					_road_lines.append({pts = piece, cls = c, bridge = brunnel == "bridge"})
-					Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, piece,
-						ROADS[c][0] + 1.5, 3)
+			add_road.call(r, c)
+	for s in _neighbour_structures:
+		var key := "%s|%s|%d" % [s.kind, s.cls, s.layer]
+		if not structures_by_key.has(key):
+			structures_by_key[key] = []
+		structures_by_key[key].append(s.pts)
+	# OSM splits long bridges/tunnels into several ways (and tiles cut them); chain
+	# the pieces from this and the surrounding tiles, then judge and profile them whole.
+	for key: String in structures_by_key:
+		var parts := key.split("|")
+		var kind := parts[0]
+		var c := parts[1]
+		var layer := int(parts[2])
+		for r in _chain_lines(structures_by_key[key]):
+			if not _touches_tile(r):
+				continue  # entirely in a neighbour: that chunk draws it
+			if kind == "tunnel" and not _is_bored_tunnel(r):
+				if ROADS[c][1] >= DRIVABLE_RANK:
+					add_road.call(_clip_to_tile_polyline(r), c)  # underpass or passage: a road at grade
+				continue  # (underground footpaths: nothing to draw)
+			for run: Dictionary in _clip_profile(_structure_profile(r, kind, layer)):
+				if run.pts.size() >= 2:
+					_road_lines.append({pts = run.pts, heights = run.heights, cls = c,
+						bridge = kind == "bridge", tunnel = kind == "tunnel"})
+					if kind == "bridge":
+						Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, run.pts,
+							ROADS[c][0] + 1.5, 3)
 	_paint_road_owners(mask_cell)
 	_mark_dense_urban()
+
+
+# --- Bridges and tunnels -------------------------------------------------------------
+#
+# Vector tiles clip lines to the tile plus a buffer, so a long bridge or tunnel is only
+# partly known to each tile. Heights are therefore computed from information that both
+# tiles sharing a seam can see: the DEM (sampled in absolute mercator space) and, within
+# STRUCT_REACH of a point, the line itself and its real (unclipped) ends. Structures that
+# lie wholly inside one tile with both ends known use the more realistic end-to-end
+# grade instead.
+
+const BRIDGE_CLEARANCE := 5.5
+const WATER_CLEARANCE := 5.0
+const LAYER_HEIGHT := 6.0
+const TUNNEL_HEIGHT := 6.0
+const TUNNEL_COVER := 7.0  # road must be this far under the surface inside a tunnel
+const TUNNEL_MIN_RELIEF := 10.0
+const MAX_GRADE := 0.06  # steepest bridge/tunnel approach
+const ENVELOPE := 12.0
+
+
+## True if p is a genuine line end rather than a cut at the edge of the 3x3 tiles
+## this chunk knows structures for.
+func _real_end(p: Vector2) -> bool:
+	var m := size - 0.5
+	return p.x > -m and p.y > -m and p.x < size + m and p.y < size + m
+
+
+func _touches_tile(line: PackedVector2Array) -> bool:
+	for k in range(1, line.size()):
+		if _inside_tile(line[k]) or _inside_tile(line[k - 1]):
+			return true
+	return false
+
+
+## The part of a chained line inside this tile (as one polyline, for at-grade use).
+func _clip_to_tile_polyline(line: PackedVector2Array) -> PackedVector2Array:
+	var out := PackedVector2Array()
+	for p in line:
+		if _inside_tile(p):
+			out.append(p)
+	return out if out.size() >= 2 else line
+
+
+## Most OSM tunnels are underpasses beneath embankments or buildings, which the DEM
+## can't see. Only treat a line as a bored tunnel if the ground rises well above it.
+func _is_bored_tunnel(line: PackedVector2Array) -> bool:
+	var ends := maxf(_dem_at(line[0]), _dem_at(line[line.size() - 1]))
+	for p in _resample(line, 10.0):
+		if _dem_at(p) - ends >= TUNNEL_MIN_RELIEF:
+			return true
+	return false
+
+
+## Joins lines that share an endpoint into longer polylines.
+static func _chain_lines(lines: Array) -> Array[PackedVector2Array]:
+	var pool: Array[PackedVector2Array] = []
+	for l: PackedVector2Array in lines:
+		if l.size() >= 2:
+			pool.append(l)
+	var out: Array[PackedVector2Array] = []
+	while not pool.is_empty():
+		var chain: PackedVector2Array = pool.pop_back()
+		var grew := true
+		while grew:
+			grew = false
+			for i in pool.size():
+				var other := pool[i]
+				var head := chain[0]
+				var tail := chain[chain.size() - 1]
+				var joined := PackedVector2Array()
+				if tail.distance_to(other[0]) < 0.5:
+					joined = chain + other.slice(1)
+				elif tail.distance_to(other[other.size() - 1]) < 0.5:
+					var rev := other.duplicate()
+					rev.reverse()
+					joined = chain + rev.slice(1)
+				elif head.distance_to(other[other.size() - 1]) < 0.5:
+					joined = other + chain.slice(1)
+				elif head.distance_to(other[0]) < 0.5:
+					var rev := other.duplicate()
+					rev.reverse()
+					joined = rev + chain.slice(1)
+				if not joined.is_empty():
+					chain = joined
+					pool.remove_at(i)
+					grew = true
+					break
+		out.append(chain)
+	return out
+
+
+static func _polyline_length(pts: PackedVector2Array) -> float:
+	var total := 0.0
+	for k in range(1, pts.size()):
+		total += pts[k].distance_to(pts[k - 1])
+	return total
+
+
+## Resamples a bridge/tunnel line every 3 m and assigns the road surface height.
+## Returns {pts, heights}.
+func _structure_profile(line: PackedVector2Array, kind: String, layer: int) -> Dictionary:
+	var pts := _resample(line, 3.0)
+	var n := pts.size()
+	var dist := PackedFloat32Array([0.0])
+	for k in range(1, n):
+		dist.append(dist[k - 1] + pts[k].distance_to(pts[k - 1]))
+	var total := dist[n - 1]
+	var ground := PackedFloat32Array()
+	ground.resize(n)
+	for k in n:
+		ground[k] = _dem_at(pts[k])
+		if kind == "bridge":
+			ground[k] = maxf(ground[k], 0.0)  # the DEM includes the seabed; clear the water surface
+	var start_real := _real_end(pts[0])
+	var end_real := _real_end(pts[n - 1])
+	var contained := start_real and end_real
+	var hs := PackedFloat32Array()
+	hs.resize(n)
+	for k in n:
+		var grade := lerpf(ground[0], ground[n - 1], dist[k] / maxf(total, 0.01))
+		if kind == "bridge":
+			var env := -INF  # upper envelope of what the deck must clear
+			for j in n:
+				if absf(dist[j] - dist[k]) <= ENVELOPE:
+					var water := ground[j] <= 0.5 or (_inside_tile(pts[j]) and _class_at(pts[j]) == Cls.WATER)
+					var clear := WATER_CLEARANCE if water else BRIDGE_CLEARANCE
+					env = maxf(env, ground[j] + clear + (layer - 1) * LAYER_HEIGHT)
+			hs[k] = maxf(grade, env) if contained else env
+		else:
+			var deep := grade if contained else _deep_ground(pts[k]) - 2.0
+			hs[k] = minf(deep, ground[k] - TUNNEL_COVER)
+	# Approaches climb or descend at a realistic grade from the real ends.
+	for k in n:
+		if start_real:
+			hs[k] = clampf(hs[k], ground[0] - MAX_GRADE * dist[k], ground[0] + MAX_GRADE * dist[k])
+		if end_real:
+			var d := total - dist[k]
+			hs[k] = clampf(hs[k], ground[n - 1] - MAX_GRADE * d, ground[n - 1] + MAX_GRADE * d)
+	return {pts = pts, heights = _smooth(hs, 5)}
+
+
+## Lowest DEM height within ~120 m: a smooth stand-in for a tunnel's grade that depends
+## only on absolute position.
+func _deep_ground(p: Vector2) -> float:
+	var lowest := _dem_at(p)
+	for r: float in [60.0, 120.0]:
+		for a in 8:
+			lowest = minf(lowest, _dem_at(p + Vector2.from_angle(a * TAU / 8.0) * r))
+	return lowest
+
+
+## Cuts a profile to the tile, interpolating heights at the border.
+func _clip_profile(profile: Dictionary) -> Array[Dictionary]:
+	var pts: PackedVector2Array = profile.pts
+	var hs: PackedFloat32Array = profile.heights
+	var out: Array[Dictionary] = []
+	var cur_p := PackedVector2Array()
+	var cur_h := PackedFloat32Array()
+	var inside := func(p: Vector2) -> bool:
+		return p.x >= 0.0 and p.y >= 0.0 and p.x <= size and p.y <= size
+	for k in pts.size():
+		var in_k: bool = inside.call(pts[k])
+		if k > 0 and in_k != inside.call(pts[k - 1]):
+			var t := _border_t(pts[k - 1], pts[k])
+			cur_p.append(pts[k - 1].lerp(pts[k], t))
+			cur_h.append(lerpf(hs[k - 1], hs[k], t))
+			if not in_k:
+				out.append({pts = cur_p, heights = cur_h})
+				cur_p = PackedVector2Array()
+				cur_h = PackedFloat32Array()
+		if in_k:
+			cur_p.append(pts[k])
+			cur_h.append(hs[k])
+	if cur_p.size() >= 2:
+		out.append({pts = cur_p, heights = cur_h})
+	return out
+
+
+## Parameter along a->b where the segment crosses the tile border (exactly one of the
+## two points is inside).
+func _border_t(a: Vector2, b: Vector2) -> float:
+	var a_in := _inside_tile(a)
+	var lo := 0.0
+	var hi := 1.0
+	for i in 24:
+		var mid := (lo + hi) * 0.5
+		if _inside_tile(a.lerp(b, mid)) == a_in:
+			lo = mid
+		else:
+			hi = mid
+	return (lo + hi) * 0.5
+
+
+func _inside_tile(p: Vector2) -> bool:
+	return p.x >= 0.0 and p.y >= 0.0 and p.x <= size and p.y <= size
 
 
 ## Marks which road covers each mask cell, so props can tell junctions apart from
@@ -358,9 +629,24 @@ func _water() -> void:
 					var jj := j + dj
 					if ii >= 0 and jj >= 0 and ii < _n and jj < _n and not is_nan(_water_level[jj * _n + ii]):
 						level = minf(level, _water_level[jj * _n + ii])
-			if level < INF:
+			# Not in towns or under roads/buildings: there the banks are quays and
+			# embankments, and lowering them sinks whole islands and riverside streets.
+			if level < INF and _class[v] != Cls.URBAN and not _masked_near(i, j):
 				_shore[v] = 1
 				_h[v] = minf(_h[v], level - 0.6)
+
+
+## True if the fine mask has a road or building within about one vertex cell.
+func _masked_near(i: int, j: int) -> bool:
+	var scale := float(MASK_RES) / (_n - 1)
+	var ci := int(i * scale)
+	var cj := int(j * scale)
+	var r := int(scale)
+	for mj in range(maxi(cj - r, 0), mini(cj + r + 1, MASK_RES)):
+		for mi in range(maxi(ci - r, 0), mini(ci + r + 1, MASK_RES)):
+			if _mask[mj * MASK_RES + mi] >= 2:
+				return true
+	return false
 
 
 # --- Stage: road flattening ---------------------------------------------------------
@@ -523,23 +809,42 @@ func _add_skirts(verts: PackedVector3Array, colors: PackedColorArray, indices: P
 			indices.append_array([a, base + k + 1, b, a, base + k, base + k + 1])
 
 
+## Water surface on the vertex grid with one level per vertex, so neighbouring quads
+## share edges (per-quad levels left hairline gaps). Shore vertices take the level of
+## the water next to them.
 func _build_water_mesh() -> void:
+	var level := PackedFloat32Array()
+	level.resize(_n * _n)
+	for j in _n:
+		for i in _n:
+			var v := j * _n + i
+			if not is_nan(_water_level[v]):
+				level[v] = _water_level[v]
+				continue
+			var sum := 0.0
+			var cnt := 0
+			for dj in range(-1, 2):
+				for di in range(-1, 2):
+					var ii := i + di
+					var jj := j + dj
+					if ii >= 0 and jj >= 0 and ii < _n and jj < _n and not is_nan(_water_level[jj * _n + ii]):
+						sum += _water_level[jj * _n + ii]
+						cnt += 1
+			level[v] = sum / cnt if cnt > 0 else NAN
 	var verts := PackedVector3Array()
 	for j in _n - 1:
 		for i in _n - 1:
-			var corners := [j * _n + i, j * _n + i + 1, (j + 1) * _n + i + 1, (j + 1) * _n + i]
-			var level := 0.0
-			var cnt := 0
-			for v: int in corners:
-				if not is_nan(_water_level[v]):
-					level += _water_level[v]
-					cnt += 1
-			if cnt == 0:
+			var c := [j * _n + i, j * _n + i + 1, (j + 1) * _n + i + 1, (j + 1) * _n + i]
+			var any_water := false
+			var complete := true
+			for v: int in c:
+				any_water = any_water or not is_nan(_water_level[v])
+				complete = complete and not is_nan(level[v])
+			if not (any_water and complete):
 				continue
-			level /= cnt
-			var y := level - 0.3
-			var p := [Vector3(i * _cell, y, j * _cell), Vector3((i + 1) * _cell, y, j * _cell),
-				Vector3((i + 1) * _cell, y, (j + 1) * _cell), Vector3(i * _cell, y, (j + 1) * _cell)]
+			var p := []
+			for v: int in c:
+				p.append(Vector3((v % _n) * _cell, level[v] - 0.3, (v / _n) * _cell))
 			verts.append_array([p[0], p[1], p[2], p[0], p[2], p[3]])
 	water = {vertices = verts}
 
@@ -558,32 +863,34 @@ func _build_roads() -> void:
 		var rank: int = spec[1]
 		var color: Color = spec[2]
 		color.a = spec[3] / 2.0
-		var pts := _resample(road.pts, 3.0)
+		var structure: bool = road.bridge or road.tunnel
+		var pts: PackedVector2Array = road.pts if structure else _resample(road.pts, 3.0)
 		if pts.size() < 2:
 			continue
 		# OSM widths cover the travel lanes; urban side streets also get parking lanes.
-		if (rank == 4 or rank == 5) and _class_at(pts[pts.size() / 2]) == Cls.URBAN:
+		if not structure and (rank == 4 or rank == 5) and _class_at(pts[pts.size() / 2]) == Cls.URBAN:
 			hw += 2.2
 		# Extend free ends (not on the tile border) to cover gaps at junctions.
 		var first_dir := (pts[1] - pts[0]).normalized()
 		var last_dir := (pts[pts.size() - 1] - pts[pts.size() - 2]).normalized()
-		if not _on_border(pts[0]):
+		if not structure and not _on_border(pts[0]):
 			pts.insert(0, pts[0] - first_dir * hw * 0.8)
-		if not _on_border(pts[pts.size() - 1]):
+		if not structure and not _on_border(pts[pts.size() - 1]):
 			pts.append(pts[pts.size() - 1] + last_dir * hw * 0.8)
 		var lift := 0.12 + rank * 0.025
 		var heights := PackedFloat32Array()
 		heights.resize(pts.size())
 		if road.bridge:
-			var h0 := height_at(pts[0])
-			var h1 := height_at(pts[pts.size() - 1])
-			var total := 0.0
-			var dist := PackedFloat32Array([0.0])
-			for k in range(1, pts.size()):
-				total += pts[k].distance_to(pts[k - 1])
-				dist.append(total)
+			# Never let the deck dip below the (final) terrain, e.g. near its ends.
 			for k in pts.size():
-				heights[k] = lerpf(h0, h1, dist[k] / maxf(total, 0.01)) + lift
+				heights[k] = maxf(road.heights[k], height_at(pts[k])) + lift
+			_build_bridge(pts, heights, hw, road_idx, rank >= DRIVABLE_RANK)
+		elif road.tunnel:
+			# Near the portals the final terrain can sit below the raw DEM (carving,
+			# flattening); never let the tunnel float above it.
+			for k in pts.size():
+				heights[k] = minf(road.heights[k], height_at(pts[k])) + lift
+			_build_tunnel(pts, heights, hw)
 		else:
 			# Sit on the highest of centre and both edges so terrain can't poke through.
 			for k in pts.size():
@@ -615,16 +922,260 @@ func _build_roads() -> void:
 			if k > 0:
 				var a := base + (k - 1) * 2
 				indices.append_array([a, a + 1, a + 2, a + 1, a + 3, a + 2])
-				if road.bridge:
-					bridge_faces.append_array([verts[a], verts[a + 1], verts[a + 2],
+				if structure:
+					structure_faces.append_array([verts[a], verts[a + 1], verts[a + 2],
 						verts[a + 1], verts[a + 3], verts[a + 2]])
-		if rank >= DRIVABLE_RANK:
+		if rank >= DRIVABLE_RANK and not road.tunnel:
 			road_spawn.append({pts = spawn_pts, rank = rank})
-		if rank >= 6 and not road.bridge:
+		if rank >= 6 and not structure:
 			_place_lamps(pts, heights, hw, lift)
-		if not road.bridge:
+		if not structure:
 			_place_street_props(pts, heights, hw, lift, rank, road_idx)
 	roads = {vertices = verts, uvs = uvs, colors = colors, indices = indices}
+	_cut_portal_collision()
+	structures = {vertices = _s_verts, normals = _s_normals, colors = _s_colors,
+		uvs = _s_uvs, uv2s = _s_uv2s}
+
+
+# --- Structure geometry ----------------------------------------------------------------
+
+const CONCRETE := Color(0.62, 0.61, 0.58, 0.0)  # alpha 0: no windows in the building shader
+const TUNNEL_WALL := Color(0.55, 0.53, 0.47, 0.0)
+
+var _s_verts := PackedVector3Array()
+var _s_normals := PackedVector3Array()
+var _s_colors := PackedColorArray()
+var _s_uvs := PackedVector2Array()
+var _s_uv2s := PackedVector2Array()
+
+
+## Quad a-b-c-d (in order around the face) facing `nrm`; optionally also collidable.
+func _s_quad(a: Vector3, b: Vector3, c: Vector3, d: Vector3, nrm: Vector3, color: Color,
+		collide := false) -> void:
+	var uv := [Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]
+	_tri(a, b, c, nrm, color, _s_verts, _s_normals, _s_colors, _s_uvs, _s_uv2s, uv, Vector2.ZERO)
+	_tri(a, c, d, nrm, color, _s_verts, _s_normals, _s_colors, _s_uvs, _s_uv2s, uv, Vector2.ZERO)
+	if collide:
+		structure_faces.append_array([a, b, c, a, c, d])
+
+
+## Box between two points along the road, `half` wide, from y0 to y1 at each end.
+func _s_beam(p0: Vector2, p1: Vector2, half: float, y0a: float, y1a: float, y0b: float,
+		y1b: float, color: Color, collide := false) -> void:
+	var dir := (p1 - p0).normalized()
+	var side := Vector2(-dir.y, dir.x) * half
+	var corners := [p0 + side, p1 + side, p1 - side, p0 - side]
+	var lo := [y0a, y0b, y0b, y0a]
+	var hi := [y1a, y1b, y1b, y1a]
+	var mid := (p0 + p1) * 0.5
+	for i in 4:
+		var a: Vector2 = corners[i]
+		var b: Vector2 = corners[(i + 1) % 4]
+		var face := (a + b) * 0.5 - mid
+		var out := Vector3(face.x, 0, face.y).normalized()
+		_s_quad(Vector3(a.x, lo[i], a.y), Vector3(b.x, lo[(i + 1) % 4], b.y),
+			Vector3(b.x, hi[(i + 1) % 4], b.y), Vector3(a.x, hi[i], a.y), out, color, collide)
+	_s_quad(Vector3(corners[0].x, hi[0], corners[0].y), Vector3(corners[1].x, hi[1], corners[1].y),
+		Vector3(corners[2].x, hi[2], corners[2].y), Vector3(corners[3].x, hi[3], corners[3].y),
+		Vector3.UP, color)
+
+
+func _build_bridge(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float,
+		road_idx: int, railings: bool) -> void:
+	var since_pillar := 15.0
+	for k in range(1, pts.size()):
+		var a := pts[k - 1]
+		var b := pts[k]
+		var ya := heights[k - 1]
+		var yb := heights[k]
+		var dir := (b - a).normalized()
+		var side := Vector2(-dir.y, dir.x)
+		# Deck slab under the road surface.
+		_s_beam(a, b, hw + 0.3, ya - 1.3, ya - 0.02, yb - 1.3, yb - 0.02, CONCRETE)
+		# Railings (collidable so the car stays on the bridge), except where another
+		# road shares the deck, e.g. a footway or junction joining it.
+		for s: float in [1.0, -1.0]:
+			var off := side * s * (hw + 0.15)
+			if not railings or _near_other_road((a + b) * 0.5 + off, road_idx, 1.5):
+				continue
+			_s_beam(a + off, b + off, 0.15, ya - 0.1, ya + 0.9, yb - 0.1, yb + 0.9, CONCRETE, true)
+		# Pillars where the deck is well above the ground.
+		since_pillar += a.distance_to(b)
+		var g := height_at(b)
+		if since_pillar >= 30.0 and yb - g > 3.0:
+			since_pillar = 0.0
+			var half := minf(hw * 0.35, 1.2)
+			var p0 := b - dir * half
+			var p1 := b + dir * half
+			_s_beam(p0, p1, half, g - 1.0, yb - 1.3, g - 1.0, yb - 1.3, CONCRETE)
+			var bs := size / BLOCKS
+			var block := clampi(int(b.y / bs), 0, BLOCKS - 1) * BLOCKS + clampi(int(b.x / bs), 0, BLOCKS - 1)
+			if building_faces.is_empty():
+				building_faces.resize(BLOCKS * BLOCKS)
+			var c0 := Vector3(b.x, g - 1.0, b.y)
+			var c1 := Vector3(b.x, yb - 1.3, b.y)
+			var s3 := Vector3(side.x, 0, side.y) * half
+			building_faces[block].append_array([c0 - s3, c0 + s3, c1 + s3, c0 - s3, c1 + s3, c1 - s3])
+
+
+## Tunnel tube shaped to the terrain: on the open approach the walls are retaining walls
+## only as tall as the ground beside them; the roof starts where the hill covers the
+## tube, with a headwall up to the hillside there (the portal face).
+func _build_tunnel(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float) -> void:
+	var wall := hw + 0.8
+	var run_start := 0
+	var n := pts.size()
+	# Per point: ground height along both walls, and whether the roof is buried.
+	var ground := PackedFloat32Array()
+	var covered: Array[bool] = []
+	for k in n:
+		var d := (pts[mini(k + 1, n - 1)] - pts[maxi(k - 1, 0)]).normalized()
+		var side := Vector2(-d.y, d.x) * wall
+		var g := maxf(height_at(pts[k] + side), height_at(pts[k] - side))
+		ground.append(maxf(g, height_at(pts[k])))
+		covered.append(height_at(pts[k]) >= heights[k] + TUNNEL_HEIGHT + 0.5)
+	for k in range(1, n):
+		var a := pts[k - 1]
+		var b := pts[k]
+		var ya := heights[k - 1]
+		var yb := heights[k]
+		var dir := (b - a).normalized()
+		var side := Vector2(-dir.y, dir.x)
+		_tunnel_segments.append({a = a, b = b, ha = ya, hb = yb, wall = wall})
+		var roof := covered[k - 1] and covered[k]
+		var top_a := TUNNEL_HEIGHT if roof else clampf(ground[k - 1] - ya + 0.5, 1.0, TUNNEL_HEIGHT)
+		var top_b := TUNNEL_HEIGHT if roof else clampf(ground[k] - yb + 0.5, 1.0, TUNNEL_HEIGHT)
+		for s: float in [1.0, -1.0]:
+			var pa := a + side * s * wall
+			var pb := b + side * s * wall
+			var inward := Vector3(-side.x * s, 0, -side.y * s)
+			var q := [Vector3(pa.x, ya - 0.3, pa.y), Vector3(pb.x, yb - 0.3, pb.y),
+				Vector3(pb.x, yb + top_b, pb.y), Vector3(pa.x, ya + top_a, pa.y)]
+			_s_quad(q[0], q[1], q[2], q[3], inward, TUNNEL_WALL, true)
+			_s_quad(q[0], q[1], q[2], q[3], -inward, CONCRETE)  # outside, seen at portals
+		var l0 := a + side * wall
+		var l1 := b + side * wall
+		var r0 := a - side * wall
+		var r1 := b - side * wall
+		if roof:
+			var ca := ya + TUNNEL_HEIGHT
+			var cb := yb + TUNNEL_HEIGHT
+			var ceiling := [Vector3(l0.x, ca, l0.y), Vector3(l1.x, cb, l1.y), Vector3(r1.x, cb, r1.y), Vector3(r0.x, ca, r0.y)]
+			_s_quad(ceiling[0], ceiling[1], ceiling[2], ceiling[3], Vector3.DOWN, TUNNEL_WALL)
+			_s_quad(ceiling[0], ceiling[1], ceiling[2], ceiling[3], Vector3.UP, CONCRETE)
+		# Headwall where the roof begins or ends: from the roof up past the hillside.
+		if covered[k - 1] != covered[k]:
+			var at := k if covered[k] else k - 1
+			var p := pts[at]
+			var y0 := heights[at] + TUNNEL_HEIGHT
+			var y1 := maxf(ground[at], y0) + 1.0
+			var l := p + side * (wall + 1.0)
+			var r := p - side * (wall + 1.0)
+			var facing := Vector3(-dir.x, 0, -dir.y) if covered[k] else Vector3(dir.x, 0, dir.y)
+			var face := [Vector3(l.x, y0, l.y), Vector3(r.x, y0, r.y), Vector3(r.x, y1, r.y), Vector3(l.x, y1, l.y)]
+			_s_quad(face[0], face[1], face[2], face[3], facing, CONCRETE)
+			_s_quad(face[0], face[1], face[2], face[3], -facing, CONCRETE)
+		# Volumes: one box per ~30 m run.
+		var run_len := pts[run_start].distance_to(b)
+		if run_len >= 30.0 or k == pts.size() - 1:
+			_add_tunnel_box(pts, heights, run_start, k, wall)
+			run_start = k
+	# Keep trees and props off the tunnel approaches.
+	var mask_cell := size / MASK_RES
+	Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, pts, wall + 2.0, 3)
+
+
+## Removes heightmap collision over tunnel mouths. Jolt drops every cell touching a NaN
+## vertex, so cells around each portal are knocked out and re-added as exact triangles,
+## except those over the tube itself.
+func _cut_portal_collision() -> void:
+	if portal_boxes.is_empty() or collision.is_empty():
+		return
+	var inverse: Array[Transform3D] = []
+	for box in portal_boxes:
+		inverse.append(box.affine_inverse())
+	# Terrain point within a tube's width and above its road (it would block the car).
+	# Where the tunnel is still at grade the ground stays solid.
+	var over_tube := func(p: Vector3) -> bool:
+		var near_portal := false
+		for inv in inverse:
+			var q := inv * p
+			if absf(q.x) <= 1.05 and absf(q.z) <= 1.05:
+				near_portal = true
+				break
+		if not near_portal:
+			return false
+		var p2 := Vector2(p.x, p.z)
+		for seg in _tunnel_segments:
+			var a: Vector2 = seg.a
+			var ab: Vector2 = seg.b - a
+			var t := clampf((p2 - a).dot(ab) / maxf(ab.length_squared(), 1e-6), 0.0, 1.0)
+			if p2.distance_to(a + ab * t) > seg.wall + 0.3:
+				continue
+			var road: float = lerpf(seg.ha, seg.hb, t)
+			if p.y > road + 0.3 and p.y < road + TUNNEL_HEIGHT + 3.0:
+				return true
+		return false
+	var surface := func(x: float, z: float) -> Vector3:
+		return Vector3(x, height_at(Vector2(x, z)), z)
+	# Knock out every cell the tube passes under (sampled, since cells are ~19 m).
+	var holes := _h.duplicate()
+	for j in _n - 1:
+		for i in _n - 1:
+			var hit := false
+			for sj in 5:
+				for si in 5:
+					if over_tube.call(surface.call((i + si / 4.0) * _cell, (j + sj / 4.0) * _cell)):
+						hit = true
+			if hit:
+				for c in [j * _n + i, j * _n + i + 1, (j + 1) * _n + i + 1, (j + 1) * _n + i]:
+					holes[c] = NAN
+	# Jolt drops every cell touching a NaN vertex. Rebuild all of those from ~2 m
+	# sub-triangles on the same surface, leaving out only the ones over a tube.
+	var sub := ceili(_cell / 2.0)
+	var step := _cell / sub
+	for j in _n - 1:
+		for i in _n - 1:
+			var a := j * _n + i
+			if not (is_nan(holes[a]) or is_nan(holes[a + 1]) or is_nan(holes[a + _n]) or is_nan(holes[a + _n + 1])):
+				continue
+			for sj in sub:
+				for si in sub:
+					var x0 := i * _cell + si * step
+					var z0 := j * _cell + sj * step
+					var p00: Vector3 = surface.call(x0, z0)
+					var p10: Vector3 = surface.call(x0 + step, z0)
+					var p11: Vector3 = surface.call(x0 + step, z0 + step)
+					var p01: Vector3 = surface.call(x0, z0 + step)
+					if not over_tube.call((p00 + p10 + p11) / 3.0):
+						terrain_patch_faces.append_array([p00, p10, p11])
+					if not over_tube.call((p00 + p11 + p01) / 3.0):
+						terrain_patch_faces.append_array([p00, p11, p01])
+	collision.collision_heights = holes
+
+
+func _add_tunnel_box(pts: PackedVector2Array, heights: PackedFloat32Array, i0: int, i1: int,
+		wall: float) -> void:
+	var a := pts[i0]
+	var b := pts[i1]
+	var y_lo := INF
+	var y_hi := -INF
+	var surface_gap := INF  # smallest distance from the tunnel ceiling up to the terrain
+	for k in range(i0, i1 + 1):
+		y_lo = minf(y_lo, heights[k])
+		y_hi = maxf(y_hi, heights[k])
+		surface_gap = minf(surface_gap, height_at(pts[k]) - (heights[k] + TUNNEL_HEIGHT))
+	var centre2 := (a + b) * 0.5
+	var dir := (b - a).normalized()
+	# Exactly the run's length: past the ends the approach road relies on terrain collision.
+	var x := Vector3(dir.x, 0, dir.y) * (a.distance_to(b) * 0.5)
+	var z := Vector3(-dir.y, 0, dir.x) * (wall + 1.0)
+	var y := Vector3.UP * ((y_hi - y_lo) * 0.5 + TUNNEL_HEIGHT * 0.5 + 1.5)
+	var centre := Vector3(centre2.x, (y_lo + y_hi) * 0.5 + TUNNEL_HEIGHT * 0.5, centre2.y)
+	var box := Transform3D(Basis(x, y, z), centre)
+	tunnel_boxes.append(box)
+	if surface_gap < 3.0:
+		portal_boxes.append(box)
 
 
 ## Street lamps on alternating sides; the model's arm points along +x.
@@ -755,7 +1306,8 @@ func _build_buildings() -> void:
 	var uv2s := PackedVector2Array()
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
 	var k := _to_local("building") if _layers.has("building") else 1.0
-	building_faces.resize(BLOCKS * BLOCKS)
+	if building_faces.is_empty():
+		building_faces.resize(BLOCKS * BLOCKS)
 	var local_heights := _known_height_medians(k)
 	for f: Dictionary in _features("building"):
 		if f.tags.get("hide_3d", false):

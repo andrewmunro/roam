@@ -19,7 +19,7 @@ func has_tile(t: Vector2i) -> bool:
 ## Tiles needed to sample anywhere inside the mercator rect, plus a margin that
 ## covers the vector tile buffer.
 static func tiles_for_rect(mx0: float, my0: float, mx1: float, my1: float) -> Array[Vector2i]:
-	var margin := Geo.tile_size_merc(ZOOM) / SIZE * 5.0
+	var margin := Geo.tile_size_merc(ZOOM) / SIZE * 9.0  # vector tile buffer + tunnel grade samples
 	var a := Geo.merc_to_tile(mx0 - margin, my1 + margin, ZOOM)
 	var b := Geo.merc_to_tile(mx1 + margin, my0 - margin, ZOOM)
 	var out: Array[Vector2i] = []

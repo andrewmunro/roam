@@ -2,10 +2,19 @@ extends Node
 ## Rebuilds one tile from the fetch cache and checks road heights against terrain.
 ## Run: godot --headless --path . res://tests/test_chunk_heights.tscn
 
-const TILE := Vector2i(2617, 6332)
+var TILE := Vector2i(2617, 6332)
+var probe := Vector3.INF  # world point to list nearby roads around
 
 func _ready() -> void:
 	Geo.set_origin(37.76938, -122.4862)
+	for a in OS.get_cmdline_user_args():
+		if a.begins_with("--latlon="):
+			var ll := a.substr(9).split(",")
+			Geo.set_origin(ll[0].to_float(), ll[1].to_float())
+			TILE = Geo.local_to_tile(Vector3.ZERO, 14)
+		elif a.begins_with("--probe="):
+			var v := a.substr(8).split(",")
+			probe = Vector3(v[0].to_float(), v[1].to_float(), v[2].to_float())
 	var elev := ElevationSource.new()
 	var m := Geo.tile_origin_merc(TILE, 14)
 	var s := Geo.tile_size_merc(14)
@@ -39,4 +48,14 @@ func _ready() -> void:
 	for p in tv:
 		worst_t = maxf(worst_t, absf(b.height_at(Vector2(p.x, p.z)) - p.y))
 	print("terrain mesh vs height_at max diff %.3f m" % worst_t)
+	if probe != Vector3.INF:
+		var local := probe - Geo.tile_origin_local(TILE, 14)
+		var p2 := Vector2(local.x, local.z)
+		for road: Dictionary in b._road_lines:
+			for k in road.pts.size():
+				if road.pts[k].distance_to(p2) < 15.0:
+					var h: float = road.heights[k] if road.has("heights") else NAN
+					print("  road %s bridge=%s tunnel=%s profile_h=%.1f terrain=%.1f dem=%.1f" % [road.cls, road.bridge, road.tunnel, h, b.height_at(road.pts[k]), b._dem_at(road.pts[k])])
+					break
+		print("  tunnel boxes %d portals %d" % [b.tunnel_boxes.size(), b.portal_boxes.size()])
 	get_tree().quit()

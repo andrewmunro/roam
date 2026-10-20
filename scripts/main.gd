@@ -11,9 +11,11 @@ extends Node3D
 @onready var hud: CanvasLayer = $HUD
 
 var _spawn_pending := false
+var _stuck_check := 0.0
 
 
 func _ready() -> void:
+	car.streamer = streamer
 	streamer.chunk_ready.connect(_on_chunk_ready)
 	hud.teleport_requested.connect(teleport)
 	teleport(start_lat, start_lon, start_label)
@@ -26,6 +28,21 @@ func teleport(lat: float, lon: float, label: String) -> void:
 	car.global_transform = Transform3D(Basis.IDENTITY, Vector3.ZERO)
 	_spawn_pending = true
 	hud.set_status("Loading %s…" % label)
+
+
+func _physics_process(delta: float) -> void:
+	_stuck_check += delta
+	if _spawn_pending or car.freeze or _stuck_check < 0.5:
+		return
+	_stuck_check = 0.0
+	# Safety net: if the car ended up under the terrain outside a tunnel, put it back.
+	if streamer.in_tunnel_box(car.global_position):
+		return
+	var p := car.global_position
+	var hit := get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+		p + Vector3.UP * 0.5, p + Vector3.UP * 500.0, 1 << (Chunk.TERRAIN_LAYER - 1)))
+	if not hit.is_empty() or p.y < -1000.0:
+		_place_on_road(p, car.global_transform.basis.z)
 
 
 func _unhandled_input(event: InputEvent) -> void:

@@ -65,6 +65,30 @@ func chunk_at(local_pos: Vector3) -> Chunk:
 	return null
 
 
+## True if the position is inside any tunnel volume (this tile or a neighbour, since
+## boxes can poke slightly over a tile edge).
+func in_tunnel_box(global_pos: Vector3) -> bool:
+	var t := Geo.local_to_tile(global_pos, Geo.CHUNK_ZOOM)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var c: Chunk = _chunks.get(t + Vector2i(dx, dy))
+			if c and not c.tunnel_boxes.is_empty() and c.in_tunnel_box(global_pos - c.position):
+				return true
+	return false
+
+
+## True if the position is in a tunnel and under the ground (so a surface road running
+## alongside a portal doesn't count).
+func in_tunnel(global_pos: Vector3) -> bool:
+	if not in_tunnel_box(global_pos):
+		return false
+	var c: Chunk = _chunks.get(Geo.local_to_tile(global_pos, Geo.CHUNK_ZOOM))
+	if c == null:
+		return true
+	var local := global_pos - c.position
+	return c.terrain_height(Vector2(local.x, local.z)) > global_pos.y + 0.3
+
+
 func is_loading() -> bool:
 	return not _jobs.is_empty()
 
@@ -110,21 +134,26 @@ func _update_rings() -> void:
 	# Drop elevation tiles no longer near anything we keep.
 	var keep := {}
 	for t: Vector2i in _chunks.keys() + _jobs.keys():
-		for e in _elevation_tiles(t):
+		var lod: int = _jobs[t].lod if _jobs.has(t) else _chunks[t].lod
+		for e in _elevation_tiles(t, 1 if lod == ChunkBuilder.Lod.FULL else 0):
 			keep[e] = true
 	elevation.forget_far(keep)
 
 
-func _elevation_tiles(t: Vector2i) -> Array[Vector2i]:
+## Elevation tiles covering the chunk plus `ring` chunks around it (full chunks profile
+## bridges and tunnels across their neighbours).
+func _elevation_tiles(t: Vector2i, ring := 0) -> Array[Vector2i]:
 	var m := Geo.tile_origin_merc(t, Geo.CHUNK_ZOOM)
 	var s := Geo.tile_size_merc(Geo.CHUNK_ZOOM)
-	return ElevationSource.tiles_for_rect(m[0], m[1] - s, m[0] + s, m[1])
+	return ElevationSource.tiles_for_rect(m[0] - ring * s, m[1] - s - ring * s,
+		m[0] + s + ring * s, m[1] + ring * s)
 
 
 func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 	var gen := _generation
+	var full := lod == ChunkBuilder.Lod.FULL
 	var job := {lod = lod, state = "fetch", builder = null, task = -1, chunk = null,
-		mvt = PackedByteArray(), waiting = 1 if lod == ChunkBuilder.Lod.HORIZON else 2}
+		mvt = PackedByteArray(), neighbours = {}, waiting = 10 if full else 1}
 	_jobs[t] = job
 	var priority := float(_ring_dist(t)) + (0.0 if lod == ChunkBuilder.Lod.FULL else 0.5)
 	var arrived := func() -> void:
@@ -132,21 +161,35 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 			return
 		job.waiting -= 1
 		if job.waiting == 0:
-			var tiles := _elevation_tiles(t)
-			job.builder = ChunkBuilder.new(t, lod, job.mvt, elevation.snapshot(tiles))
+			var tiles := _elevation_tiles(t, 1 if full else 0)
+			job.builder = ChunkBuilder.new(t, lod, job.mvt, elevation.snapshot(tiles), job.neighbours)
 			job.mvt = PackedByteArray()
+			job.neighbours = {}
 			job.state = "build"
 			if _use_threads:
 				job.task = WorkerThreadPool.add_task(job.builder.run_all, false, "chunk %s" % t)
-	elevation.ensure(_elevation_tiles(t), priority, arrived)
-	if lod == ChunkBuilder.Lod.FULL:
-		var n := 1 << Geo.CHUNK_ZOOM
-		var url := _tile_url.replace("{z}", str(Geo.CHUNK_ZOOM)) \
-			.replace("{x}", str(posmod(t.x, n))).replace("{y}", str(clampi(t.y, 0, n - 1)))
-		Fetch.request(url, func(ok: bool, body: PackedByteArray) -> void:
+	elevation.ensure(_elevation_tiles(t, 1 if full else 0), priority, arrived)
+	if full:
+		Fetch.request(_mvt_url(t), func(ok: bool, body: PackedByteArray) -> void:
 			if ok:
 				job.mvt = body
 			arrived.call(), priority)
+		# Neighbours' roads, so bridges and tunnels can be followed across tile edges.
+		for dy in range(-1, 2):
+			for dx in range(-1, 2):
+				if dx == 0 and dy == 0:
+					continue
+				var offset := Vector2i(dx, dy)
+				Fetch.request(_mvt_url(t + offset), func(ok: bool, body: PackedByteArray) -> void:
+					if ok:
+						job.neighbours[offset] = body
+					arrived.call(), priority + 0.3)
+
+
+func _mvt_url(t: Vector2i) -> String:
+	var n := 1 << Geo.CHUNK_ZOOM
+	return _tile_url.replace("{z}", str(Geo.CHUNK_ZOOM)) \
+		.replace("{x}", str(posmod(t.x, n))).replace("{y}", str(clampi(t.y, 0, n - 1)))
 
 
 func _run_jobs() -> void:

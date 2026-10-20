@@ -39,9 +39,25 @@ func _process(delta: float) -> void:
 	fwd = fwd.normalized().rotated(Vector3.UP, _orbit)
 	if not _dragging:
 		_orbit = lerpf(_orbit, 0.0, 1.0 - exp(-delta * 1.5))
-	var desired := xf.origin - fwd * distance + Vector3.UP * (height + distance * 0.12)
+	var tunnel: bool = target is Car and target.in_tunnel
+	var dist := minf(distance, 6.0) if tunnel else distance
+	var desired := xf.origin - fwd * dist + Vector3.UP * ((1.8 if tunnel else height) + dist * 0.12)
+	# Spring arm: don't let walls, roofs or hillsides come between camera and car.
+	var pivot := xf.origin + Vector3.UP * 1.2
+	var exclude: Array[RID] = []
+	if target is CollisionObject3D:
+		exclude.append(target.get_rid())
+	var block := get_world_3d().direct_space_state.intersect_ray(
+		PhysicsRayQueryParameters3D.create(pivot, desired, 0xFFFFFFFF, exclude))
+	if not block.is_empty():
+		desired = block.position + (pivot - block.position).normalized() * 0.4
 	var t := 1.0 - exp(-delta * stiffness)
 	global_position = global_position.lerp(desired, t)
+	if not block.is_empty():
+		global_position = desired  # snap in, otherwise the lerp clips through
+	if tunnel:
+		look_at(xf.origin + Vector3.UP * 1.2, Vector3.UP)
+		return
 	# Don't sink into the ground on crests.
 	var space := get_world_3d().direct_space_state
 	var hit := space.intersect_ray(PhysicsRayQueryParameters3D.create(

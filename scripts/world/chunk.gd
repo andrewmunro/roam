@@ -14,6 +14,12 @@ var tile: Vector2i
 var lod: ChunkBuilder.Lod
 var size := 0.0
 var road_spawn: Array[Dictionary] = []
+var tunnel_boxes: Array[Transform3D] = []  ## see ChunkBuilder.tunnel_boxes
+var portal_boxes: Array[Transform3D] = []
+var _tunnel_inverse: Array[Transform3D] = []
+var _heights := PackedFloat32Array()  # terrain grid, for height queries
+var _grid_n := 0
+var _grid_cell := 1.0
 var ready_for_physics := false
 
 var _builder: ChunkBuilder
@@ -49,7 +55,15 @@ func finalize_step() -> bool:
 	var b := _builder
 	match _finalize_step:
 		0:
-			_add_mesh("Terrain", _array_mesh(b.terrain, true), terrain_material, 1)
+			_add_mesh("Terrain", _array_mesh(b.terrain, true), _terrain_material_for(b.portal_boxes), 1)
+			if not b.collision.is_empty():
+				_heights = b.collision.heights
+				_grid_n = b.collision.width
+				_grid_cell = b.collision.cell
+			tunnel_boxes = b.tunnel_boxes
+			portal_boxes = b.portal_boxes
+			for box in tunnel_boxes:
+				_tunnel_inverse.append(box.affine_inverse())
 			if not b.collision.is_empty():
 				_add_heightmap(b.collision)
 				ready_for_physics = true
@@ -60,7 +74,9 @@ func finalize_step() -> bool:
 				var roads := _add_mesh("Roads", _array_mesh(b.roads, true), road_material, 1 | MINIMAP_LAYER)
 				roads.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 			road_spawn = b.road_spawn
-			_add_trimesh("BridgeCollision", b.bridge_faces)
+			_add_trimesh("StructureCollision", b.structure_faces)
+			if not b.structures.is_empty() and b.structures.vertices.size() > 0:
+				_add_mesh("Structures", _array_mesh(b.structures, false), building_material, 1)
 		2:
 			if not b.buildings.is_empty() and b.buildings.vertices.size() > 0:
 				_add_mesh("Buildings", _array_mesh(b.buildings, false), building_material, 1)
@@ -84,6 +100,52 @@ func finalize_step() -> bool:
 		_builder = null
 		return true
 	return false
+
+
+const MAX_PORTALS := 16
+const TERRAIN_LAYER := 2  ## physics layer bit for terrain (cars ignore it inside tunnels)
+
+
+## The shared terrain material, or a copy that cuts holes where tunnels meet the surface.
+func _terrain_material_for(portals: Array[Transform3D]) -> ShaderMaterial:
+	if portals.is_empty():
+		return terrain_material
+	var m: ShaderMaterial = terrain_material.duplicate()
+	var inv: Array[Projection] = []
+	for i in mini(portals.size(), MAX_PORTALS):
+		inv.append(Projection(portals[i].affine_inverse()))
+	m.set_shader_parameter("portal_count", inv.size())
+	m.set_shader_parameter("portals", inv)
+	return m
+
+
+## True if the chunk-local point is inside one of this chunk's tunnel volumes.
+func in_tunnel_box(local_pos: Vector3) -> bool:
+	for inv in _tunnel_inverse:
+		var p := inv * local_pos
+		if absf(p.x) <= 1.0 and absf(p.y) <= 1.0 and absf(p.z) <= 1.0:
+			return true
+	return false
+
+
+## Terrain height at a chunk-local x/z, on the same triangles as ChunkBuilder.height_at.
+func terrain_height(p: Vector2) -> float:
+	if _heights.is_empty():
+		return -INF
+	var n := _grid_n
+	var fx := clampf(p.x / _grid_cell, 0.0, n - 1.001)
+	var fz := clampf(p.y / _grid_cell, 0.0, n - 1.001)
+	var i := floori(fx)
+	var j := floori(fz)
+	var u := fx - i
+	var v := fz - j
+	var h00 := _heights[j * n + i]
+	var h11 := _heights[(j + 1) * n + i + 1]
+	if u >= v:
+		var h10 := _heights[j * n + i + 1]
+		return h00 + u * (h10 - h00) + v * (h11 - h10)
+	var h01 := _heights[(j + 1) * n + i]
+	return h00 + v * (h01 - h00) + u * (h11 - h01)
 
 
 static func _array_mesh(data: Dictionary, indexed: bool) -> ArrayMesh:
@@ -122,7 +184,7 @@ func _add_mesh(node_name: String, mesh: Mesh, material: Material, layers: int) -
 
 func _add_heightmap(c: Dictionary) -> void:
 	var cell: float = c.cell
-	var heights: PackedFloat32Array = c.heights.duplicate()
+	var heights: PackedFloat32Array = c.get("collision_heights", c.heights).duplicate()
 	for i in heights.size():
 		heights[i] /= cell
 	var shape := HeightMapShape3D.new()
@@ -131,6 +193,7 @@ func _add_heightmap(c: Dictionary) -> void:
 	shape.map_data = heights
 	var body := StaticBody3D.new()
 	body.name = "TerrainCollision"
+	body.collision_layer = 1 << (TERRAIN_LAYER - 1)
 	var cs := CollisionShape3D.new()
 	cs.shape = shape
 	cs.position = Vector3(size * 0.5, 0, size * 0.5)
@@ -151,9 +214,11 @@ func _add_boxes(xfs: Array, aabb: AABB) -> void:
 		cs.transform = xf * Transform3D(Basis.IDENTITY, aabb.get_center())
 		body.add_child(cs)
 	add_child(body)
+	if not _builder.terrain_patch_faces.is_empty():
+		_add_trimesh("TerrainPatchCollision", _builder.terrain_patch_faces, 1 << (TERRAIN_LAYER - 1))
 
 
-func _add_trimesh(node_name: String, faces: PackedVector3Array) -> void:
+func _add_trimesh(node_name: String, faces: PackedVector3Array, layer := 1) -> void:
 	if faces.is_empty():
 		return
 	var shape := ConcavePolygonShape3D.new()
@@ -161,6 +226,7 @@ func _add_trimesh(node_name: String, faces: PackedVector3Array) -> void:
 	shape.set_faces(faces)
 	var body := StaticBody3D.new()
 	body.name = node_name
+	body.collision_layer = layer
 	var cs := CollisionShape3D.new()
 	cs.shape = shape
 	body.add_child(cs)

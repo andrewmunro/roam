@@ -18,6 +18,8 @@ extends RigidBody3D
 const RAY_UP := 0.35  # ray starts this far above the modelled wheel centre
 const DROOP := 0.25  # extra extension below the modelled position
 
+var streamer: WorldStreamer
+var in_tunnel := false
 var _wheels: Array[Dictionary] = []
 var _steer := 0.0
 var _speed := 0.0
@@ -30,6 +32,8 @@ func _ready() -> void:
 	center_of_mass = Vector3(0, 0.4, 0)
 	angular_damp = 0.5
 	continuous_cd = true
+	can_sleep = false  # forces from the wheel rays don't wake a sleeping body
+	collision_mask = 1 | (1 << (Chunk.TERRAIN_LAYER - 1))  # world + terrain (also used by wheel rays)
 	freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
 	var model := Catalog.instantiate(model_path)
 	model.name = "Model"
@@ -118,6 +122,9 @@ func _physics_process(delta: float) -> void:
 		steer_in = 0.0
 		handbrake = false
 
+	# Terrain has collision holes at tunnel mouths, so nothing to switch here; the
+	# flag is for the camera and the stuck-under-terrain safety net.
+	in_tunnel = streamer != null and streamer.in_tunnel(global_position)
 	var xf := global_transform
 	var up := xf.basis.y
 	var fwd := xf.basis.z

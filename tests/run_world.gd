@@ -12,6 +12,8 @@ var _drive_after := 0.0
 var _report_every := 5.0
 var _topdown := 0.0
 var _look_around := false
+var _look_tunnel := false
+var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
 var _checked := false
 var _rebase_test := false
 var _rebase_stage := 0
@@ -30,6 +32,10 @@ func _ready() -> void:
 			_drive = true
 		elif a.begins_with("--drive-after="):
 			_drive_after = a.substr(14).to_float()
+		elif a == "--tunnel-drive":
+			_tunnel_drive = 1
+		elif a == "--look-tunnel":
+			_look_tunnel = true
 		elif a == "--look-around":
 			_look_around = true
 		elif a.begins_with("--topdown="):
@@ -56,6 +62,12 @@ func _process(delta: float) -> void:
 	var car: Car = _main.get_node("Car")
 	if _drive and not car.freeze and _t > _drive_after:
 		Input.action_press("accelerate")
+	if _look_tunnel and not car.freeze:
+		_aim_at_tunnel()
+	if _tunnel_drive == 1 and not car.freeze and _t > 4.0:
+		_start_tunnel_drive(car)
+	if _tunnel_drive == 2:
+		Input.action_press("accelerate", 0.6)
 	if _rebase_test:
 		_run_rebase_test(car)
 	if not car.freeze and not _checked and _t > 3.0:
@@ -70,6 +82,29 @@ func _process(delta: float) -> void:
 			_t, chunks.size(), full, world._jobs.size(), car.freeze, car.global_position.snapped(Vector3.ONE * 0.1),
 			car.speed_kmh(), _max_frame_ms])
 		_max_frame_ms = 0.0
+		if not car.freeze:
+			var p := car.global_position
+			var up_hit := car.get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+				p + Vector3.UP * 0.5, p + Vector3.UP * 500.0, 2))
+			var down_hit := car.get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+				p + Vector3.UP * 0.5, p - Vector3.UP * 50.0, 0xFFFFFFFF, [car.get_rid()]))
+			var fwd := car.global_transform.basis.z
+			var ahead := car.get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+				p + Vector3.UP * 0.8, p + Vector3.UP * 0.8 + fwd * 6.0, car.collision_mask, [car.get_rid()]))
+			if not ahead.is_empty():
+				print("  ahead: %s/%s at %.1f m, normal %s" % [ahead.collider.get_parent().name, ahead.collider.name,
+					(ahead.position - p).length(), ahead.normal.snapped(Vector3.ONE * 0.01)])
+			print("  vel=%s throttle=%.2f wheels=%s sleeping=%s focus=%s" % [car.linear_velocity.snapped(Vector3.ONE * 0.01),
+				Input.get_action_strength("accelerate"), car._wheels.map(func(w): return w.contact),
+				car.sleeping, get_viewport().gui_get_focus_owner()])
+			car.contact_monitor = true
+			car.max_contacts_reported = 6
+			var touching := car.get_colliding_bodies().map(func(b): return "%s/%s" % [b.get_parent().name, b.name])
+			if not touching.is_empty():
+				print("  touching: ", touching)
+			print("  in_tunnel=%s terrain_above=%s below=%s" % [car.in_tunnel,
+				"none" if up_hit.is_empty() else "%.1f" % up_hit.position.y,
+				"none" if down_hit.is_empty() else "%s@%.1f" % [down_hit.collider.name, down_hit.position.y]])
 		if _topdown > 0.0 and not car.freeze:
 			var cam: Camera3D = _main.get_node("Camera")
 			cam.set_process(false)
@@ -104,7 +139,7 @@ func _check_roads(car: Car) -> void:
 	var worst_info := ""
 	for k in range(0, verts.size(), 7):
 		var p := chunk.to_global(verts[k])
-		var hit := space.intersect_ray(PhysicsRayQueryParameters3D.create(p + Vector3.UP * 100, p - Vector3.UP * 100, 1, [car.get_rid()]))
+		var hit := space.intersect_ray(PhysicsRayQueryParameters3D.create(p + Vector3.UP * 100, p - Vector3.UP * 100, 3, [car.get_rid()]))
 		if hit.is_empty() or hit.collider.name != "TerrainCollision":
 			continue
 		var diff: float = hit.position.y - p.y
@@ -141,3 +176,76 @@ func _run_rebase_test(car: Car) -> void:
 			Geo.origin_latlon(), car.global_position, (ll - _rebase_latlon).length(), worst])
 		print("REBASE PASS" if worst < 0.01 and car.global_position.length() < 2000.0 else "REBASE FAIL")
 		_rebase_stage = 2
+
+
+## Points the camera into the nearest tunnel portal, moving round it on each shot.
+func _aim_at_tunnel() -> void:
+	var world: WorldStreamer = _main.get_node("World")
+	var cam: Camera3D = _main.get_node("Camera")
+	var car: Car = _main.get_node("Car")
+	var best := Transform3D()
+	var best_d := INF
+	for c in world.get_children():
+		if c is Chunk:
+			for box: Transform3D in c.portal_boxes:
+				var g: Transform3D = c.transform * box
+				var d: float = g.origin.distance_to(car.global_position)
+				if d < best_d:
+					best_d = d
+					best = g
+	if best_d == INF:
+		print("no tunnels loaded")
+		return
+	cam.set_process(false)
+	var along := best.basis.x.normalized()
+	var side := best.basis.z.normalized()
+	var offsets := [along * 40.0, -along * 40.0, along * 25.0 + side * 20.0, Vector3.UP * 60.0 + along * 30.0]
+	var off: Vector3 = offsets[_shot_idx % offsets.size()]
+	var pos := best.origin + off
+	var hit := car.get_world_3d().direct_space_state.intersect_ray(
+		PhysicsRayQueryParameters3D.create(pos + Vector3.UP * 300, pos - Vector3.UP * 300, 2))
+	if not hit.is_empty():
+		pos.y = maxf(pos.y + 4.0, hit.position.y + 3.0)
+	cam.global_position = pos
+	cam.look_at(best.origin, Vector3.UP)
+
+
+## Puts the car just outside the nearest portal, facing into the tunnel.
+func _start_tunnel_drive(car: Car) -> void:
+	var world: WorldStreamer = _main.get_node("World")
+	var best_d := INF
+	var start := Vector3.ZERO
+	var dir := Vector3.ZERO
+	for c in world.get_children():
+		if not c is Chunk:
+			continue
+		for box: Transform3D in c.portal_boxes:
+			var g: Transform3D = c.transform * box
+			var d: float = g.origin.distance_to(car.global_position)
+			if d >= best_d:
+				continue
+			var e0: Vector3 = g.origin - g.basis.x
+			var e1: Vector3 = g.origin + g.basis.x
+			var road_y: float = g.origin.y - g.basis.y.length() + 1.5
+			# The mouth is the end where the surface is closest to the road.
+			var gap0: float = c.terrain_height(Vector2(e0.x - c.position.x, e0.z - c.position.z)) - road_y
+			var gap1: float = c.terrain_height(Vector2(e1.x - c.position.x, e1.z - c.position.z)) - road_y
+			var along: Vector3 = g.basis.x.normalized()
+			best_d = d
+			if gap0 <= gap1:
+				start = e0 - along * 25.0
+				dir = along
+			else:
+				start = e1 + along * 25.0
+				dir = -along
+	if best_d == INF:
+		print("tunnel drive: no portal found")
+		_tunnel_drive = 0
+		return
+	var hit := car.get_world_3d().direct_space_state.intersect_ray(
+		PhysicsRayQueryParameters3D.create(start + Vector3.UP * 200, start - Vector3.UP * 200))
+	if not hit.is_empty():
+		start.y = hit.position.y + 0.8
+	car.place(start, dir)
+	_tunnel_drive = 2
+	print("tunnel drive: start %s dir %s" % [start, dir])
