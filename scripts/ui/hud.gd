@@ -51,7 +51,7 @@ func _build_search() -> void:
 	var row := HBoxContainer.new()
 	column.add_child(row)
 	_search = LineEdit.new()
-	_search.placeholder_text = "Search a place or enter lat, lon…"
+	_search.placeholder_text = "Search a place or enter lat, lonâ€¦"
 	_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_search.text_submitted.connect(_on_search)
 	row.add_child(_search)

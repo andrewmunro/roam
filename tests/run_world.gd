@@ -11,6 +11,7 @@ var _drive := false
 var _drive_after := 0.0
 var _report_every := 5.0
 var _topdown := 0.0
+var _look_around := false
 var _checked := false
 var _rebase_test := false
 var _rebase_stage := 0
@@ -29,6 +30,8 @@ func _ready() -> void:
 			_drive = true
 		elif a.begins_with("--drive-after="):
 			_drive_after = a.substr(14).to_float()
+		elif a == "--look-around":
+			_look_around = true
 		elif a.begins_with("--topdown="):
 			_topdown = a.substr(10).to_float()
 		elif a.begins_with("--every="):
@@ -72,6 +75,12 @@ func _process(delta: float) -> void:
 			cam.set_process(false)
 			cam.global_position = car.global_position + Vector3(0, _topdown, _topdown * 0.6)
 			cam.look_at(car.global_position, Vector3.UP)
+		if _look_around and not car.freeze:
+			var cam: Camera3D = _main.get_node("Camera")
+			cam.set_process(false)
+			var yaw := _shot_idx * PI / 2.0
+			cam.global_position = car.global_position + Vector3(0, 8, 0)
+			cam.look_at(cam.global_position + Vector3(sin(yaw), -0.15, cos(yaw)), Vector3.UP)
 		if not _shots.is_empty() and not car.freeze:
 			var img := get_viewport().get_texture().get_image()
 			img.save_png(_shots.path_join("shot_%02d.png" % _shot_idx))

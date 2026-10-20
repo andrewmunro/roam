@@ -1,10 +1,10 @@
 class_name Raster
-## Scanline rasterisation onto byte grids. Cell (i, j) is sampled at its centre,
+## Scanline rasterisation onto packed grids (PackedByteArray or PackedInt32Array). Cell (i, j) is sampled at its centre,
 ## ((i + 0.5) * cell, (j + 0.5) * cell), in the same units as the polygon points.
 
 
 ## Fills all rings with even-odd rule (so holes are respected when passed together).
-static func fill_rings(grid: PackedByteArray, w: int, h: int, cell: float,
+static func fill_rings(grid: Variant, w: int, h: int, cell: float,
 		rings: Array[PackedVector2Array], value: int) -> void:
 	var min_y := INF
 	var max_y := -INF
@@ -34,14 +34,14 @@ static func fill_rings(grid: PackedByteArray, w: int, h: int, cell: float,
 				grid[row + i] = value
 
 
-static func fill_polygon(grid: PackedByteArray, w: int, h: int, cell: float,
+static func fill_polygon(grid: Variant, w: int, h: int, cell: float,
 		poly: PackedVector2Array, value: int) -> void:
 	var rings: Array[PackedVector2Array] = [poly]
 	fill_rings(grid, w, h, cell, rings, value)
 
 
 ## Marks every cell within `half_width` of the polyline.
-static func stroke_polyline(grid: PackedByteArray, w: int, h: int, cell: float,
+static func stroke_polyline(grid: Variant, w: int, h: int, cell: float,
 		line: PackedVector2Array, half_width: float, value: int) -> void:
 	for k in line.size() - 1:
 		var a := line[k]

@@ -4,12 +4,11 @@ extends Node3D
 ## steps (one per frame) so node creation doesn't cause a single long hitch.
 
 const MINIMAP_LAYER := 2
-const SCATTER_RANGE := 900.0
 
 static var terrain_material: ShaderMaterial
 static var road_material: ShaderMaterial
 static var water_material: ShaderMaterial
-static var building_material: StandardMaterial3D
+static var building_material: ShaderMaterial
 
 var tile: Vector2i
 var lod: ChunkBuilder.Lod
@@ -20,6 +19,7 @@ var ready_for_physics := false
 var _builder: ChunkBuilder
 var _finalize_step := 0
 var _collision_block := 0
+var _scatter_block := 0
 
 
 static func _ensure_materials() -> void:
@@ -31,10 +31,8 @@ static func _ensure_materials() -> void:
 	road_material.shader = load("res://shaders/road.gdshader")
 	water_material = ShaderMaterial.new()
 	water_material.shader = load("res://shaders/water.gdshader")
-	building_material = StandardMaterial3D.new()
-	building_material.vertex_color_use_as_albedo = true
-	building_material.vertex_color_is_srgb = true
-	building_material.roughness = 0.9
+	building_material = ShaderMaterial.new()
+	building_material.shader = load("res://shaders/building.gdshader")
 
 
 func setup(builder: ChunkBuilder) -> void:
@@ -75,7 +73,12 @@ func finalize_step() -> bool:
 			if _collision_block < b.building_faces.size():
 				return false
 		4:
-			_add_scatter(b.scatter)
+			var start := Time.get_ticks_usec()
+			while _scatter_block < b.scatter.size() and Time.get_ticks_usec() - start < 4000:
+				_add_scatter_block(b.scatter[_scatter_block])
+				_scatter_block += 1
+			if _scatter_block < b.scatter.size():
+				return false
 	_finalize_step += 1
 	if _finalize_step > 4:
 		_builder = null
@@ -98,6 +101,8 @@ static func _array_mesh(data: Dictionary, indexed: bool) -> ArrayMesh:
 		arrays[Mesh.ARRAY_COLOR] = data.colors
 	if data.has("uvs"):
 		arrays[Mesh.ARRAY_TEX_UV] = data.uvs
+	if data.has("uv2s"):
+		arrays[Mesh.ARRAY_TEX_UV2] = data.uv2s
 	if indexed and data.has("indices"):
 		arrays[Mesh.ARRAY_INDEX] = data.indices
 	var mesh := ArrayMesh.new()
@@ -134,6 +139,20 @@ func _add_heightmap(c: Dictionary) -> void:
 	add_child(body)
 
 
+## One static body holding a box per instance (shared shape per mesh variant).
+func _add_boxes(xfs: Array, aabb: AABB) -> void:
+	var shape := BoxShape3D.new()
+	shape.size = aabb.size * 0.95
+	var body := StaticBody3D.new()
+	body.name = "PropCollision"
+	for xf: Transform3D in xfs:
+		var cs := CollisionShape3D.new()
+		cs.shape = shape
+		cs.transform = xf * Transform3D(Basis.IDENTITY, aabb.get_center())
+		body.add_child(cs)
+	add_child(body)
+
+
 func _add_trimesh(node_name: String, faces: PackedVector3Array) -> void:
 	if faces.is_empty():
 		return
@@ -148,36 +167,35 @@ func _add_trimesh(node_name: String, faces: PackedVector3Array) -> void:
 	add_child(body)
 
 
-func _add_scatter(blocks: Array[Dictionary]) -> void:
-	for bucket in blocks:
-		for role: String in bucket:
-			var variants: Array = Catalog.variants(role)
-			if variants.is_empty():
+func _add_scatter_block(bucket: Dictionary) -> void:
+	for role: String in bucket:
+		var variants: Array = Catalog.variants(role)
+		if variants.is_empty():
+			continue
+		var xfs: Array = bucket[role]
+		# Split instances between the role's mesh variants deterministically.
+		var per_variant := []
+		per_variant.resize(variants.size())
+		for v in variants.size():
+			per_variant[v] = []
+		for k in xfs.size():
+			per_variant[hash(k * 7919 + tile.x) % variants.size()].append(xfs[k])
+		for v in variants.size():
+			var list: Array = per_variant[v]
+			if list.is_empty():
 				continue
-			var xfs: Array = bucket[role]
-			# Split instances between the role's mesh variants deterministically.
-			var per_variant := []
-			per_variant.resize(variants.size())
-			for v in variants.size():
-				per_variant[v] = []
-			for k in xfs.size():
-				per_variant[hash(k * 7919 + tile.x) % variants.size()].append(xfs[k])
-			for v in variants.size():
-				var list: Array = per_variant[v]
-				if list.is_empty():
-					continue
-				var mm := MultiMesh.new()
-				mm.transform_format = MultiMesh.TRANSFORM_3D
-				mm.mesh = variants[v].mesh
-				mm.instance_count = list.size()
-				var inner: Transform3D = variants[v].xf
-				for k in list.size():
-					var xf: Transform3D = list[k]
-					mm.set_instance_transform(k, xf * inner)
-				var mmi := MultiMeshInstance3D.new()
-				mmi.multimesh = mm
-				mmi.material_override = Catalog.atlas_material
-				mmi.visibility_range_end = SCATTER_RANGE
-				mmi.visibility_range_end_margin = 50.0
-				mmi.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED
-				add_child(mmi)
+			var mm := MultiMesh.new()
+			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.mesh = variants[v].mesh
+			mm.instance_count = list.size()
+			for k in list.size():
+				mm.set_instance_transform(k, list[k])
+			if role in Catalog.SOLID_ROLES:
+				_add_boxes(list, variants[v].aabb)
+			var mmi := MultiMeshInstance3D.new()
+			mmi.multimesh = mm
+			mmi.material_override = Catalog.atlas_material
+			mmi.visibility_range_end = Catalog.VISIBILITY.get(role, Catalog.DEFAULT_VISIBILITY)
+			mmi.visibility_range_end_margin = 50.0
+			mmi.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED
+			add_child(mmi)

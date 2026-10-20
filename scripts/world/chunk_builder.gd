@@ -65,6 +65,7 @@ var _n := 0  # vertices per side
 var _cell := 0.0  # vertex spacing
 var _class := PackedByteArray()  # per vertex
 var _mask := PackedByteArray()  # MASK_RES^2, non-zero = no scatter
+var _road_owner := PackedInt32Array()  # MASK_RES^2, index+1 of the road last drawn there
 var _h := PackedFloat32Array()  # final terrain heights per vertex
 var _water_level := PackedFloat32Array()  # per vertex, NAN if not water
 var _shore := PackedByteArray()  # 1 = non-water vertex next to water (kept noise-free)
@@ -223,7 +224,34 @@ func _classify() -> void:
 					_road_lines.append({pts = piece, cls = c, bridge = brunnel == "bridge"})
 					Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, piece,
 						ROADS[c][0] + 1.5, 3)
+	_paint_road_owners(mask_cell)
 	_mark_dense_urban()
+
+
+## Marks which road covers each mask cell, so props can tell junctions apart from
+## plain road edges.
+func _paint_road_owners(mask_cell: float) -> void:
+	_road_owner.resize(MASK_RES * MASK_RES)
+	_road_owner.fill(0)
+	for idx in _road_lines.size():
+		var road: Dictionary = _road_lines[idx]
+		if ROADS[road.cls][1] >= DRIVABLE_RANK:
+			Raster.stroke_polyline(_road_owner, MASK_RES, MASK_RES, mask_cell, road.pts,
+				ROADS[road.cls][0], idx + 1)
+
+
+## True if a road other than `idx` is within `radius` metres of p.
+func _near_other_road(p: Vector2, idx: int, radius: float) -> bool:
+	var mask_cell := size / MASK_RES
+	var r := ceili(radius / mask_cell)
+	var ci := int(p.x / mask_cell)
+	var cj := int(p.y / mask_cell)
+	for j in range(maxi(cj - r, 0), mini(cj + r + 1, MASK_RES)):
+		for i in range(maxi(ci - r, 0), mini(ci + r + 1, MASK_RES)):
+			var o := _road_owner[j * MASK_RES + i]
+			if o != 0 and o != idx + 1:
+				return true
+	return false
 
 
 ## OSM often has no landuse polygons in city centres; treat ground that is mostly
@@ -523,7 +551,8 @@ func _build_roads() -> void:
 	var uvs := PackedVector2Array()
 	var colors := PackedColorArray()
 	var indices := PackedInt32Array()
-	for road in _road_lines:
+	for road_idx in _road_lines.size():
+		var road: Dictionary = _road_lines[road_idx]
 		var spec: Array = ROADS[road.cls]
 		var hw: float = spec[0]
 		var rank: int = spec[1]
@@ -532,6 +561,9 @@ func _build_roads() -> void:
 		var pts := _resample(road.pts, 3.0)
 		if pts.size() < 2:
 			continue
+		# OSM widths cover the travel lanes; urban side streets also get parking lanes.
+		if (rank == 4 or rank == 5) and _class_at(pts[pts.size() / 2]) == Cls.URBAN:
+			hw += 2.2
 		# Extend free ends (not on the tile border) to cover gaps at junctions.
 		var first_dir := (pts[1] - pts[0]).normalized()
 		var last_dir := (pts[pts.size() - 1] - pts[pts.size() - 2]).normalized()
@@ -590,6 +622,8 @@ func _build_roads() -> void:
 			road_spawn.append({pts = spawn_pts, rank = rank})
 		if rank >= 6 and not road.bridge:
 			_place_lamps(pts, heights, hw, lift)
+		if not road.bridge:
+			_place_street_props(pts, heights, hw, lift, rank, road_idx)
 	roads = {vertices = verts, uvs = uvs, colors = colors, indices = indices}
 
 
@@ -612,6 +646,80 @@ func _place_lamps(pts: PackedVector2Array, heights: PackedFloat32Array, hw: floa
 		var arm := -Vector3(nrm.x, 0, nrm.y)  # towards the road centre
 		var basis := Basis(arm, Vector3.UP, arm.cross(Vector3.UP))
 		_add_instance("lamp_road", Transform3D(basis, Vector3(p.x, heights[k] - lift, p.y)))
+
+
+## Parked cars along urban side streets, street furniture on the pavement and stop
+## signs where minor roads end at a junction.
+func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float,
+		lift: float, rank: int, road_idx: int) -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = hash(pts[0]) ^ _seed
+	var mask_cell := size / MASK_RES
+	var total := 0.0
+	var dist := PackedFloat32Array([0.0])
+	for k in range(1, pts.size()):
+		total += pts[k].distance_to(pts[k - 1])
+		dist.append(total)
+	var sample := func(d: float) -> Array:  # [point, direction, ground height] at distance d
+		var k := clampi(dist.bsearch(d), 1, pts.size() - 1)
+		var t := clampf((d - dist[k - 1]) / maxf(dist[k] - dist[k - 1], 0.001), 0.0, 1.0)
+		var dir := (pts[k] - pts[k - 1]).normalized()
+		return [pts[k - 1].lerp(pts[k], t), dir, lerpf(heights[k - 1], heights[k], t) - lift]
+	var free_spot := func(p: Vector2) -> bool:
+		var mi := clampi(int(p.x / mask_cell), 0, MASK_RES - 1)
+		var mj := clampi(int(p.y / mask_cell), 0, MASK_RES - 1)
+		return _mask[mj * MASK_RES + mi] == 0 and p.x > 0.0 and p.y > 0.0 and p.x < size and p.y < size
+	var urban := _class_at(pts[pts.size() / 2]) == Cls.URBAN
+	# Parked cars sit just inside the road edge, facing the direction of traffic.
+	if urban and (rank == 4 or rank == 5) and total > 40.0:
+		for side: float in [1.0, -1.0]:
+			var d := 12.0 + rng.randf() * 6.0
+			while d < total - 12.0:
+				if rng.randf() < 0.55:
+					var s: Array = sample.call(d)
+					var fwd: Vector2 = s[1]
+					var nrm := Vector2(-fwd.y, fwd.x) * side
+					var p: Vector2 = s[0] + nrm * (hw - 1.1)
+					if not _near_other_road(p, road_idx, 4.0):
+						_add_instance("parked_car", _facing(Vector3(p.x, s[2] + lift, p.y), fwd * side))
+				d += rng.randf_range(6.5, 9.0)
+	# Hydrants, bins, benches and mailboxes on the pavement.
+	if urban and rank >= 4 and rank <= 7:
+		var d := rng.randf() * 20.0
+		while d < total:
+			var s: Array = sample.call(d)
+			var fwd: Vector2 = s[1]
+			var side := 1.0 if rng.randf() < 0.5 else -1.0
+			var nrm := Vector2(-fwd.y, fwd.x) * side
+			var p: Vector2 = s[0] + nrm * (hw + 2.6)
+			if free_spot.call(p):
+				_add_instance("street_furniture", _facing(Vector3(p.x, height_at(p), p.y), -nrm))
+			d += rng.randf_range(15.0, 35.0)
+	# Stop signs at junction ends of minor roads (ends not on the tile border).
+	if (rank == 3 or rank == 4) and total > 25.0:
+		for end in [0, 1]:
+			var e := pts[0] if end == 0 else pts[pts.size() - 1]
+			if _on_border(e):
+				continue
+			var s: Array = sample.call(4.0 if end == 0 else total - 4.0)
+			var fwd: Vector2 = s[1]
+			var toward := -fwd if end == 0 else fwd  # direction of travel into the junction
+			var right := Vector2(-toward.y, toward.x)
+			var p: Vector2 = s[0] + right * (hw + 1.0)
+			if free_spot.call(p):
+				_add_instance("sign_stop", _facing(Vector3(p.x, height_at(p), p.y), -toward))
+
+
+## Transform at `pos` whose +Z (the pack models' front) points along `dir`.
+static func _facing(pos: Vector3, dir: Vector2) -> Transform3D:
+	var z := Vector3(dir.x, 0.0, dir.y).normalized()
+	return Transform3D(Basis(Vector3.UP.cross(z), Vector3.UP, z), pos)
+
+
+func _class_at(p: Vector2) -> int:
+	var i := clampi(roundi(p.x / _cell), 0, _n - 1)
+	var j := clampi(roundi(p.y / _cell), 0, _n - 1)
+	return _class[j * _n + i]
 
 
 func _add_instance(role: String, xf: Transform3D) -> void:
@@ -643,6 +751,8 @@ func _build_buildings() -> void:
 	var verts := PackedVector3Array()
 	var normals := PackedVector3Array()
 	var colors := PackedColorArray()
+	var uvs := PackedVector2Array()
+	var uv2s := PackedVector2Array()
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
 	var k := _to_local("building") if _layers.has("building") else 1.0
 	building_faces.resize(BLOCKS * BLOCKS)
@@ -661,18 +771,25 @@ func _build_buildings() -> void:
 				if absf(MVTDecoder.ring_area(piece)) < 12.0:
 					continue
 				var color: Color = BUILDING_COLORS[hash(piece[0]) % BUILDING_COLORS.size()]
-				_extrude(piece, min_h, height, color, verts, normals, colors)
-	buildings = {vertices = verts, normals = normals, colors = colors}
+				_extrude(piece, min_h, height, color, verts, normals, colors, uvs, uv2s)
+	buildings = {vertices = verts, normals = normals, colors = colors, uvs = uvs, uv2s = uv2s}
 
 
+## Walls get UV = (metres along the perimeter, metres above ground) for the facade
+## shader; UV2 = (building height, per-building random); COLOR.a = 1 walls, 0 roof.
 func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Color,
-		verts: PackedVector3Array, normals: PackedVector3Array, colors: PackedColorArray) -> void:
+		verts: PackedVector3Array, normals: PackedVector3Array, colors: PackedColorArray,
+		uvs: PackedVector2Array, uv2s: PackedVector2Array) -> void:
 	var ground := INF
 	for p in poly:
 		ground = minf(ground, height_at(p))
 	var bottom := ground + min_h - (2.0 if min_h == 0.0 else 0.0)
 	var top := ground + height
 	var roof := color.darkened(0.35)
+	roof.a = 0.0
+	color.a = 1.0
+	var info := Vector2(height - min_h, (hash(poly[0]) % 1000) / 1000.0)
+	var along := 0.0
 	var n := poly.size()
 	var ccw := MVTDecoder.ring_area(poly) > 0.0  # counter-clockwise in x/z maths sense
 	for i in n:
@@ -685,8 +802,18 @@ func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Colo
 		var edge := b - a
 		var out := Vector2(edge.y, -edge.x) if ccw else Vector2(-edge.y, edge.x)
 		var nrm := Vector3(out.x, 0, out.y).normalized()
-		_tri(a0, b0, b1, nrm, color, verts, normals, colors)
-		_tri(a0, b1, a1, nrm, color, verts, normals, colors)
+		var len := edge.length()
+		# Start each wall on a whole window bay so windows don't straddle corners.
+		var u0 := ceilf(along / 3.0) * 3.0
+		along = u0 + len
+		var v0 := bottom - ground - min_h
+		var v1 := height - min_h
+		var ua0 := Vector2(u0, v0)
+		var ub0 := Vector2(u0 + len, v0)
+		var ua1 := Vector2(u0, v1)
+		var ub1 := Vector2(u0 + len, v1)
+		_tri(a0, b0, b1, nrm, color, verts, normals, colors, uvs, uv2s, [ua0, ub0, ub1], info)
+		_tri(a0, b1, a1, nrm, color, verts, normals, colors, uvs, uv2s, [ua0, ub1, ua1], info)
 		var bs := size / BLOCKS
 		var block := clampi(int(a.y / bs), 0, BLOCKS - 1) * BLOCKS + clampi(int(a.x / bs), 0, BLOCKS - 1)
 		building_faces[block].append_array([a0, b0, b1, a0, b1, a1])
@@ -696,18 +823,22 @@ func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Colo
 		var p1 := poly[idx[t + 1]]
 		var p2 := poly[idx[t + 2]]
 		_tri(Vector3(p0.x, top, p0.y), Vector3(p1.x, top, p1.y), Vector3(p2.x, top, p2.y),
-			Vector3.UP, roof, verts, normals, colors)
+			Vector3.UP, roof, verts, normals, colors, uvs, uv2s, [p0, p1, p2], info)
 
 
 ## Appends a triangle facing `nrm` (Godot front faces are clockwise).
 static func _tri(a: Vector3, b: Vector3, c: Vector3, nrm: Vector3, color: Color,
-		verts: PackedVector3Array, normals: PackedVector3Array, colors: PackedColorArray) -> void:
+		verts: PackedVector3Array, normals: PackedVector3Array, colors: PackedColorArray,
+		uvs: PackedVector2Array, uv2s: PackedVector2Array, tri_uv: Array, info: Vector2) -> void:
 	if (b - a).cross(c - a).dot(nrm) > 0.0:
 		verts.append_array([a, c, b])
+		uvs.append_array([tri_uv[0], tri_uv[2], tri_uv[1]])
 	else:
 		verts.append_array([a, b, c])
+		uvs.append_array([tri_uv[0], tri_uv[1], tri_uv[2]])
 	normals.append_array([nrm, nrm, nrm])
 	colors.append_array([color, color, color])
+	uv2s.append_array([info, info, info])
 
 
 # --- Stage: scatter -----------------------------------------------------------------------
@@ -724,7 +855,7 @@ func _scatter_rules() -> Dictionary:
 		Cls.GRASS: [0.12, {trees: 2, "tree_conifer": 1, "bush": 3, "rock": 2}],
 		Cls.FARM: [0.02, {"bush": 1, trees: 1}],
 		Cls.FOREST: [1.6, {trees: 3, "tree_conifer": 3, "bush": 1}],
-		Cls.PARK: [0.25, {trees: 4, "bush": 2}],
+		Cls.PARK: [0.25, {trees: 4, "bush": 2, "park_furniture": 0.6}],
 		Cls.SAND: [0.03, {"rock": 1, ("tree_palm" if alat < 35.0 else "bush"): 1}],
 		Cls.URBAN: [0.06, {trees: 3, "bush": 1}],
 		Cls.WETLAND: [0.2, {"bush": 3, trees: 1}],

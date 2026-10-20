@@ -15,10 +15,21 @@ const ROLES := {
 	"rock": ["nature/stone-round", "nature/stone-oval", "nature/stone-pointy", "nature/rocks-small",
 		"nature/stone-flat"],
 	"lamp_road": ["props/lamp-road"],
+	"parked_car": ["vehicles/car-passenger", "vehicles/car-taxi", "vehicles/car-hippie-van",
+		"vehicles/jeep-open", "vehicles/car-veteran", "vehicles/car-police"],
+	"street_furniture": ["props/fire-hydrant", "props/trash-can", "props/mail-box",
+		"props/bin-wheelie", "props/bench-old", "props/bike-stand"],
+	"park_furniture": ["props/bench-forest", "props/trash-can"],
+	"sign_stop": ["props/traffic-sign-stop"],
 }
+## Roles that get box colliders, and how far away each role stays visible.
+const SOLID_ROLES := ["parked_car", "lamp_road"]
+const VISIBILITY := {"street_furniture": 250.0, "park_furniture": 300.0, "sign_stop": 300.0,
+	"parked_car": 450.0}
+const DEFAULT_VISIBILITY := 900.0
 
 var atlas_material: StandardMaterial3D
-var _meshes := {}  # role -> Array[Dictionary{mesh, xf}]
+var _meshes := {}  # role -> Array[Dictionary{mesh: Mesh, aabb: AABB}]
 
 
 func _ready() -> void:
@@ -28,8 +39,8 @@ func _ready() -> void:
 	atlas_material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 
 
-## Mesh variants for a role: [{mesh: Mesh, xf: Transform3D}] where xf is the mesh's
-## transform inside its source scene.
+## Mesh variants for a role: [{mesh: Mesh, aabb: AABB}]. Models made of several
+## meshes (vehicles have separate wheels) are merged so they work in a MultiMesh.
 func variants(role: String) -> Array:
 	if not _meshes.has(role):
 		var list := []
@@ -38,10 +49,16 @@ func variants(role: String) -> Array:
 			if scene == null:
 				continue
 			var root := scene.instantiate()
-			var mi := _first_mesh(root)
-			if mi:
-				list.append({mesh = mi.mesh, xf = _relative_xf(mi, root)})
+			var st := SurfaceTool.new()
+			var count := 0
+			for mi in _meshes_in(root):
+				for surface in mi.mesh.get_surface_count():
+					st.append_from(mi.mesh, surface, _relative_xf(mi, root))
+					count += 1
 			root.free()
+			if count > 0:
+				var mesh := st.commit()
+				list.append({mesh = mesh, aabb = mesh.get_aabb()})
 		_meshes[role] = list
 	return _meshes[role]
 
@@ -60,14 +77,13 @@ func apply_atlas(node: Node) -> void:
 		apply_atlas(c)
 
 
-static func _first_mesh(n: Node) -> MeshInstance3D:
+static func _meshes_in(n: Node) -> Array[MeshInstance3D]:
+	var out: Array[MeshInstance3D] = []
 	if n is MeshInstance3D:
-		return n
+		out.append(n)
 	for c in n.get_children():
-		var m := _first_mesh(c)
-		if m:
-			return m
-	return null
+		out.append_array(_meshes_in(c))
+	return out
 
 
 static func _relative_xf(n: Node, root: Node) -> Transform3D:
