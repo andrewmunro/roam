@@ -1,0 +1,65 @@
+[gd_scene load_steps=8 format=3]
+
+[ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
+[ext_resource type="Script" path="res://scripts/world/world_streamer.gd" id="2_world"]
+[ext_resource type="Script" path="res://scripts/vehicle/car.gd" id="3_car"]
+[ext_resource type="Script" path="res://scripts/vehicle/chase_camera.gd" id="4_cam"]
+[ext_resource type="Script" path="res://scripts/ui/hud.gd" id="5_hud"]
+
+[sub_resource type="ProceduralSkyMaterial" id="sky_mat"]
+sky_top_color = Color(0.32, 0.55, 0.85, 1)
+sky_horizon_color = Color(0.72, 0.8, 0.88, 1)
+ground_horizon_color = Color(0.72, 0.8, 0.88, 1)
+ground_bottom_color = Color(0.35, 0.4, 0.35, 1)
+
+[sub_resource type="Sky" id="sky"]
+sky_material = SubResource("sky_mat")
+
+[sub_resource type="Environment" id="env"]
+background_mode = 2
+sky = SubResource("sky")
+ambient_light_source = 2
+ambient_light_color = Color(0.78, 0.8, 0.84, 1)
+ambient_light_energy = 0.8
+tonemap_mode = 2
+fog_enabled = true
+fog_mode = 1
+fog_light_color = Color(0.72, 0.8, 0.88, 1)
+fog_density = 1.0
+fog_depth_begin = 1200.0
+fog_depth_end = 5200.0
+fog_sky_affect = 0.0
+
+[node name="Main" type="Node3D"]
+script = ExtResource("1_main")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("env")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.819152, -0.439385, 0.368688, 0.000000, 0.642788, 0.766044, -0.573576, -0.627507, 0.526541, 0, 100, 0)
+light_energy = 1.1
+shadow_enabled = true
+directional_shadow_mode = 0
+directional_shadow_max_distance = 180.0
+
+[node name="World" type="Node3D" parent="." node_paths=PackedStringArray("target")]
+script = ExtResource("2_world")
+target = NodePath("../Car")
+
+[node name="Car" type="RigidBody3D" parent="."]
+script = ExtResource("3_car")
+
+[node name="Camera" type="Camera3D" parent="." node_paths=PackedStringArray("target")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 5, -10)
+current = true
+fov = 70.0
+near = 0.2
+far = 6000.0
+script = ExtResource("4_cam")
+target = NodePath("../Car")
+
+[node name="HUD" type="CanvasLayer" parent="." node_paths=PackedStringArray("car", "streamer")]
+script = ExtResource("5_hud")
+car = NodePath("../Car")
+streamer = NodePath("../World")
