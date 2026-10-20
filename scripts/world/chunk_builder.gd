@@ -756,39 +756,137 @@ func _build_buildings() -> void:
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
 	var k := _to_local("building") if _layers.has("building") else 1.0
 	building_faces.resize(BLOCKS * BLOCKS)
+	var local_heights := _known_height_medians(k)
 	for f: Dictionary in _features("building"):
 		if f.tags.get("hide_3d", false):
 			continue
-		var height := maxf(float(f.tags.get("render_height", 6.0)), 3.0)
+		var tagged := float(f.tags.get("render_height", UNKNOWN_HEIGHT))
 		var min_h := float(f.tags.get("render_min_height", 0.0))
+		var osm_colour: Variant = _parse_colour(f.tags.get("colour"))
 		for ring: PackedVector2Array in f.rings:
 			if MVTDecoder.ring_area(ring) <= 0.0:
 				continue  # hole
 			var poly := _scale_ring(ring, k)
 			if poly.size() > 1 and poly[0] == poly[poly.size() - 1]:
 				poly.remove_at(poly.size() - 1)
+			# Keyed on absolute position so both tiles sharing a building agree.
+			var key := _abs_key(poly[0])
+			var height := maxf(tagged, 3.0)
+			if tagged == UNKNOWN_HEIGHT and min_h == 0.0:
+				height = _estimate_height(poly, key, local_heights)
 			for piece: PackedVector2Array in Geometry2D.intersect_polygons(poly, rect):
 				if absf(MVTDecoder.ring_area(piece)) < 12.0:
 					continue
-				var color: Color = BUILDING_COLORS[hash(piece[0]) % BUILDING_COLORS.size()]
-				_extrude(piece, min_h, height, color, verts, normals, colors, uvs, uv2s)
+				var color: Color = BUILDING_COLORS[key % BUILDING_COLORS.size()]
+				if osm_colour != null:
+					color = osm_colour
+				_extrude(piece, min_h, height, color, key, verts, normals, colors, uvs, uv2s)
 	buildings = {vertices = verts, normals = normals, colors = colors, uvs = uvs, uv2s = uv2s}
+
+
+## OpenMapTiles fills in exactly 5 m when OSM has neither height nor levels.
+const UNKNOWN_HEIGHT := 5.0
+const HEIGHT_CELLS := 8  # neighbourhood grid for height estimates (~240 m cells)
+
+
+## Median of the real (tagged) heights in each neighbourhood cell; -1 where none.
+func _known_height_medians(k: float) -> PackedFloat32Array:
+	var buckets := []
+	buckets.resize(HEIGHT_CELLS * HEIGHT_CELLS)
+	for b in buckets.size():
+		buckets[b] = []
+	for f: Dictionary in _features("building"):
+		var h := float(f.tags.get("render_height", UNKNOWN_HEIGHT))
+		if h == UNKNOWN_HEIGHT or h < 3.0 or float(f.tags.get("render_min_height", 0.0)) > 0.0:
+			continue
+		for ring: PackedVector2Array in f.rings:
+			if MVTDecoder.ring_area(ring) > 0.0:
+				buckets[_height_cell(ring[0] * k)].append(h)
+	var medians := PackedFloat32Array()
+	medians.resize(buckets.size())
+	for b in buckets.size():
+		var list: Array = buckets[b]
+		list.sort()
+		medians[b] = list[list.size() / 2] if list.size() >= 3 else -1.0
+	return medians
+
+
+func _height_cell(p: Vector2) -> int:
+	var cell := size / HEIGHT_CELLS
+	return clampi(int(p.y / cell), 0, HEIGHT_CELLS - 1) * HEIGHT_CELLS \
+		+ clampi(int(p.x / cell), 0, HEIGHT_CELLS - 1)
+
+
+## Height for a building OSM has no height for: like its tagged neighbours if there
+## are any (with some variation), otherwise from footprint size.
+func _estimate_height(poly: PackedVector2Array, key: int, medians: PackedFloat32Array) -> float:
+	var rnd := (key % 1000) / 1000.0
+	var cell := _height_cell(poly[0])
+	var near := -1.0
+	var ci := cell % HEIGHT_CELLS
+	var cj := cell / HEIGHT_CELLS
+	for r in 2:  # this cell, then the ring around it
+		var vals := PackedFloat32Array()
+		for dj in range(-r, r + 1):
+			for di in range(-r, r + 1):
+				var i := ci + di
+				var j := cj + dj
+				if i >= 0 and j >= 0 and i < HEIGHT_CELLS and j < HEIGHT_CELLS and medians[j * HEIGHT_CELLS + i] > 0.0:
+					vals.append(medians[j * HEIGHT_CELLS + i])
+		if not vals.is_empty():
+			vals.sort()
+			near = vals[vals.size() / 2]
+			break
+	if near > 0.0:
+		return clampf(near * lerpf(0.8, 1.2, rnd), 3.5, 60.0)
+	var area := absf(MVTDecoder.ring_area(poly))
+	if area < 40.0:
+		return 3.5  # sheds, garages
+	if area < 250.0:
+		return lerpf(6.0, 9.0, rnd)  # houses
+	return lerpf(9.0, 16.0, rnd)
+
+
+## Stable non-negative hash of a chunk-local point in absolute (mercator) metres.
+func _abs_key(p: Vector2) -> int:
+	return absi(hash(Vector2i(roundi(_merc0[0] + p.x / _scale), roundi(_merc0[1] - p.y / _scale))))
+
+
+## OSM building colour (hex or CSS name), toned down so white walls don't blow out.
+static func _parse_colour(value: Variant) -> Variant:
+	if value == null:
+		return null
+	var c := Color.from_string(str(value), Color(-1, -1, -1))
+	if c.r < 0.0:
+		return null
+	var v := c.v
+	if v > 0.82:
+		c.v = 0.82
+	elif v < 0.18:
+		c.v = 0.18
+	return c
 
 
 ## Walls get UV = (metres along the perimeter, metres above ground) for the facade
 ## shader; UV2 = (building height, per-building random); COLOR.a = 1 walls, 0 roof.
-func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Color,
+func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Color, key: int,
 		verts: PackedVector3Array, normals: PackedVector3Array, colors: PackedColorArray,
 		uvs: PackedVector2Array, uv2s: PackedVector2Array) -> void:
-	var ground := INF
+	# Floors count from the uphill side (capped for big footprints on steep slopes);
+	# downhill, the wall runs down to the ground as a windowless base.
+	var g_min := INF
+	var g_max := -INF
 	for p in poly:
-		ground = minf(ground, height_at(p))
-	var bottom := ground + min_h - (2.0 if min_h == 0.0 else 0.0)
+		var g := height_at(p)
+		g_min = minf(g_min, g)
+		g_max = maxf(g_max, g)
+	var ground := minf(g_max, g_min + 6.0)
+	var bottom := (g_min - 2.0) if min_h == 0.0 else ground + min_h
 	var top := ground + height
 	var roof := color.darkened(0.35)
 	roof.a = 0.0
 	color.a = 1.0
-	var info := Vector2(height - min_h, (hash(poly[0]) % 1000) / 1000.0)
+	var info := Vector2(height - min_h, (key % 1000) / 1000.0)
 	var along := 0.0
 	var n := poly.size()
 	var ccw := MVTDecoder.ring_area(poly) > 0.0  # counter-clockwise in x/z maths sense
