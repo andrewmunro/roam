@@ -1,0 +1,10 @@
+# Cloudflare Pages headers. Cross-origin isolation enables SharedArrayBuffer, which the
+# threaded Godot web build needs (the PWA service worker is only a fallback for this).
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/index.wasm.gz
+  Cache-Control: public, max-age=86400
+/index.pck.gz
+  Cache-Control: public, max-age=3600
