@@ -1043,10 +1043,42 @@ func _road_hw(cls: String, pts: PackedVector2Array) -> float:
 	return hw
 
 
-## Pavements line urban streets from side streets up to primary roads.
+## Pavements line built-up streets from side streets up to trunk roads (not motorways).
+## Built-up means urban land use or buildings close by anywhere along the road: city
+## centres often have no land-use polygon at all.
 func _road_paved(cls: String, pts: PackedVector2Array) -> bool:
 	var rank: int = ROADS[cls][1]
-	return rank >= 4 and rank <= 7 and _urban_at(pts[pts.size() / 2])
+	if rank < 4 or rank > 8:
+		return false
+	var dist := PackedFloat32Array([0.0])
+	for k in range(1, pts.size()):
+		dist.append(dist[k - 1] + pts[k].distance_to(pts[k - 1]))
+	var total := dist[dist.size() - 1]
+	for s in 5:
+		var d := total * (s + 0.5) / 5.0
+		var k := clampi(dist.bsearch(d), 1, pts.size() - 1)
+		var p := pts[k - 1].lerp(pts[k], clampf((d - dist[k - 1]) / maxf(dist[k] - dist[k - 1], 0.001), 0.0, 1.0))
+		if built_up_at(p):
+			return true
+	return false
+
+
+## Urban land use, or a building within BUILT_UP_RADIUS metres.
+func built_up_at(p: Vector2) -> bool:
+	if _urban_at(p):
+		return true
+	var cell := size / MASK_RES
+	var r := ceili(BUILT_UP_RADIUS / cell)
+	var ci := int(p.x / cell)
+	var cj := int(p.y / cell)
+	for mj in range(maxi(cj - r, 0), mini(cj + r + 1, MASK_RES), 2):
+		for mi in range(maxi(ci - r, 0), mini(ci + r + 1, MASK_RES), 2):
+			if _mask[mj * MASK_RES + mi] == 2:
+				return true
+	return false
+
+
+const BUILT_UP_RADIUS := 35.0
 
 
 func _urban_at(p: Vector2) -> bool:
@@ -1062,6 +1094,7 @@ func _build_network() -> RoadNetwork:
 	net.north_america = region == RegionStyle.NORTH_AMERICA
 	net.uk = region == RegionStyle.UK
 	net.height_at = height_at
+	net.built_up_at = built_up_at
 	net.have_points = _osm_complete
 	for i in range(0, _osm_points.size() - 2, 3):
 		var p := Vector2((_osm_points[i] - _merc0[0]) * _scale, (_merc0[1] - _osm_points[i + 1]) * _scale)

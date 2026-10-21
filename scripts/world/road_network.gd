@@ -35,6 +35,7 @@ var left_hand := false
 var north_america := false
 var uk := false
 var height_at: Callable  ## (Vector2) -> float, final terrain height
+var built_up_at: Callable  ## (Vector2) -> bool, urban land use or buildings nearby
 ## Overpass nodes near the tile: {pos: Vector2, kind: Pt}.
 var points: Array[Dictionary] = []
 var have_points := false  ## false: no Overpass data, so guess where the signals are
@@ -1091,6 +1092,7 @@ func _fillet_kerb(pts: PackedVector2Array, hs: PackedFloat32Array) -> void:
 func _control(c: Dictionary, arms: Array[Dictionary]) -> int:
 	var live := 0
 	var big := 0
+	var mid := 0  # tertiary and up
 	var road := 0
 	var max_rank := 0
 	var min_rank := 99
@@ -1103,6 +1105,8 @@ func _control(c: Dictionary, arms: Array[Dictionary]) -> int:
 		if arm.rank >= 4:
 			min_rank = mini(min_rank, arm.rank)
 			road += 1
+		if arm.rank >= 5:
+			mid += 1
 		if arm.rank >= 6:
 			big += 1
 		radius = maxf(radius, (arm.mouth[0] as Vector2).distance_to(c.centre))
@@ -1115,6 +1119,8 @@ func _control(c: Dictionary, arms: Array[Dictionary]) -> int:
 			return Ctl.SIGNALS
 	elif big >= 2 and road >= 3:
 		return Ctl.SIGNALS  # no data: busy junctions of main roads get lights
+	elif mid >= 2 and road >= 4 and live >= 4 and built_up_at.is_valid() and built_up_at.call(c.centre):
+		return Ctl.SIGNALS  # ...and town-centre crossroads of lesser through roads
 	if north_america and road == 4 and live == 4 and max_rank <= 5 and min_rank == max_rank:
 		return Ctl.ALL_STOP
 	return Ctl.PRIORITY
