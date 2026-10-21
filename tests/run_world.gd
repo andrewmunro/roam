@@ -11,6 +11,9 @@ var _drive := false
 var _drive_after := 0.0
 var _report_every := 5.0
 var _topdown := 0.0
+var _aerial := 0.0
+var _aerial_tilt := 0.35
+var _target := Vector2.ZERO  # requested lat/lon
 var _look_around := false
 var _look_tunnel := false
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
@@ -40,6 +43,11 @@ func _ready() -> void:
 			_look_around = true
 		elif a.begins_with("--topdown="):
 			_topdown = a.substr(10).to_float()
+		elif a.begins_with("--aerial="):
+			var parts := a.substr(9).split(",")
+			_aerial = parts[0].to_float()
+			if parts.size() > 1:
+				_aerial_tilt = parts[1].to_float()
 		elif a.begins_with("--every="):
 			_report_every = a.substr(8).to_float()
 	_main = load("res://scenes/main.tscn").instantiate()
@@ -49,6 +57,7 @@ func _ready() -> void:
 			_main.start_lat = ll[0].to_float()
 			_main.start_lon = ll[1].to_float()
 			_main.start_label = a.substr(9)
+			_target = Vector2(ll[0].to_float(), ll[1].to_float())
 	add_child(_main)
 	_last = Time.get_ticks_usec()
 
@@ -110,6 +119,18 @@ func _process(delta: float) -> void:
 			cam.set_process(false)
 			cam.global_position = car.global_position + Vector3(0, _topdown, _topdown * 0.6)
 			cam.look_at(car.global_position, Vector3.UP)
+		if _aerial > 0.0 and not car.freeze:
+			# Looks down at the requested spot (not the car), turning a quarter per shot.
+			var cam: Camera3D = _main.get_node("Camera")
+			cam.set_process(false)
+			var spot := Geo.latlon_to_local(_target.x, _target.y)
+			var hit := car.get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+				spot + Vector3.UP * 2000, spot - Vector3.UP * 2000, 2))
+			if not hit.is_empty():
+				spot.y = hit.position.y
+			var yaw := _shot_idx * PI / 2.0
+			cam.global_position = spot + Vector3(sin(yaw), 0, cos(yaw)) * _aerial * _aerial_tilt + Vector3.UP * _aerial
+			cam.look_at(spot, Vector3.UP if _aerial_tilt > 0.01 else Vector3.FORWARD)
 		if _look_around and not car.freeze:
 			var cam: Camera3D = _main.get_node("Camera")
 			cam.set_process(false)
@@ -132,12 +153,18 @@ func _check_roads(car: Car) -> void:
 	if roads == null:
 		print("no roads in chunk")
 		return
-	var verts: PackedVector3Array = roads.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
+	var arrays := roads.mesh.surface_get_arrays(0)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var cols: PackedColorArray = arrays[Mesh.ARRAY_COLOR]
 	var space := car.get_world_3d().direct_space_state
 	var worst := -INF
 	var below := 0
 	var worst_info := ""
 	for k in range(0, verts.size(), 7):
+		# Kerb feet and pavement skirts are meant to reach into the ground.
+		var ck := Vector3(cols[k].r, cols[k].g, cols[k].b)
+		if ck.distance_to(Vector3(RoadNetwork.VERGE.r, RoadNetwork.VERGE.g, RoadNetwork.VERGE.b)) < 0.02 				or ck.distance_to(Vector3(RoadNetwork.KERB_COLOR.r, RoadNetwork.KERB_COLOR.g, RoadNetwork.KERB_COLOR.b)) < 0.02:
+			continue
 		var p := chunk.to_global(verts[k])
 		var hit := space.intersect_ray(PhysicsRayQueryParameters3D.create(p + Vector3.UP * 100, p - Vector3.UP * 100, 3, [car.get_rid()]))
 		if hit.is_empty() or hit.collider.name != "TerrainCollision":
@@ -149,6 +176,8 @@ func _check_roads(car: Car) -> void:
 			worst_info = "%s/%s local=%s" % [col.get_parent().name, col.name, verts[k]]
 		if diff > 0.0:
 			below += 1
+			if diff > 0.3 and OS.has_environment("ROAM_ROAD_CHECK_VERBOSE"):
+				print("  below %.2f m: colour %s uv2 %s at %s" % [diff, cols[k], (arrays[Mesh.ARRAY_TEX_UV2] as PackedVector2Array)[k], verts[k]])
 	print("road check: %d samples, %d below terrain, worst %.2f m (chunk %s at %s)" % [verts.size() / 7, below, worst, chunk.tile, chunk.position])
 	var meshes := chunk.get_children().filter(func(c): return c is MeshInstance3D).map(func(c): return c.name)
 	print("  worst hit: ", worst_info)

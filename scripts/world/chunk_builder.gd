@@ -47,6 +47,7 @@ const ROADS := {
 	"path": [0.9, 1, Color(0.74, 0.67, 0.54), 0],
 }
 const DRIVABLE_RANK := 2  # Spawn/flatten only on roads at least this rank.
+const NETWORK_RANK := 3  # Roads from this rank up join the junction-aware RoadNetwork.
 const SKIP_PATHS := ["corridor", "platform", "elevator"]  # indoor / station platforms
 const PAVING := Color(0.66, 0.65, 0.62)
 const DIRT := Color(0.62, 0.55, 0.42)
@@ -102,6 +103,13 @@ var _neighbour_bytes := {}  # Vector2i offset -> PackedByteArray (8 surrounding 
 ## Bridge/tunnel lines from the surrounding tiles, in this chunk's space:
 ## {pts, kind, cls, layer}. Lets structures be chained and profiled across seams.
 var _neighbour_structures: Array[Dictionary] = []
+## At-grade roads of the surrounding tiles within RoadNetwork.MARGIN of this one:
+## {pts, cls, oneway}. Junctions near the seams are laid out from both sides' roads.
+var _neighbour_roads: Array[Dictionary] = []
+var _have_neighbours := false
+## Overpass nodes (signals, mini-roundabouts, stop/give-way) as [mx, my, kind, ...].
+var _osm_points := PackedFloat64Array()
+var _osm_complete := false
 var _elev: ElevationSource
 var _merc0: PackedFloat64Array  # tile NW corner, mercator
 var _scale: float
@@ -122,6 +130,10 @@ var _road_lines: Array[Dictionary] = []  # clipped to the tile: {pts, cls, bridg
 ## Unclipped (including the tile buffer) so neighbouring chunks flatten their shared
 ## edge identically.
 var _flatten_lines: Array[Dictionary] = []
+## RoadNetwork input from this tile: {pts, cls, oneway, own}.
+var _net_lines: Array[Dictionary] = []
+var _rings: Array[Vector3] = []  # roundabouts (centre x, z, outer radius), from RoadNetwork
+var _no_park := PackedByteArray()  # MASK_RES^2, 1 = too close to a junction to park
 var _noise := FastNoiseLite.new()
 
 # Outputs (read by Chunk once done())
@@ -131,6 +143,9 @@ var water := {}
 var roads := {}
 var road_spawn: Array[Dictionary] = []  # {pts: PackedVector3Array, rank: int}
 var road_names: Array[Dictionary] = []  # {pts: PackedVector2Array, name: String, ref: String}
+var road_stats := {}  ## RoadNetwork.stats: junction, roundabout and signal counts
+var signal_spots: Array[Vector2] = []
+var osm_complete := false  ## junction controls came from Overpass, not guesses
 var places: Array[Dictionary] = []  # {pos: Vector2, name: String, cls: String}
 ## Collision faces for bridge decks/railings and tunnel floors/walls.
 var structure_faces := PackedVector3Array()
@@ -151,8 +166,11 @@ var scatter: Array[Dictionary] = []  # per block: {role: Array[Transform3D]}
 
 
 func _init(p_tile: Vector2i, p_lod: Lod, mvt: PackedByteArray, elev: ElevationSource,
-		neighbours := {}) -> void:
+		neighbours := {}, osm := {}) -> void:
 	tile = p_tile
+	_osm_points = osm.get("points", PackedFloat64Array())
+	_osm_complete = osm.get("complete", false)
+	osm_complete = _osm_complete
 	lod = p_lod
 	_mvt_bytes = mvt
 	_neighbour_bytes = neighbours
@@ -200,6 +218,9 @@ func _decode() -> void:
 		_layers = MVTDecoder.decode(_mvt_bytes, LAYERS)
 	_mvt_bytes = PackedByteArray()
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
+	_have_neighbours = not _neighbour_bytes.is_empty()
+	var grown := Rect2(-RoadNetwork.MARGIN, -RoadNetwork.MARGIN, size + 2.0 * RoadNetwork.MARGIN,
+		size + 2.0 * RoadNetwork.MARGIN)
 	for offset: Vector2i in _neighbour_bytes:
 		var bytes: PackedByteArray = _neighbour_bytes[offset]
 		if bytes.is_empty():
@@ -209,10 +230,21 @@ func _decode() -> void:
 			continue
 		var k := size / float(layer.extent)
 		var shift := Vector2(offset) * size
+		# That tile's own area near ours, in its coordinates.
+		var near := Rect2(Vector2.ZERO, Vector2(size, size)).intersection(Rect2(grown.position - shift, grown.size))
+		var near_poly := PackedVector2Array([near.position, Vector2(near.end.x, near.position.y), near.end,
+			Vector2(near.position.x, near.end.y)])
 		for f: Dictionary in layer.features:
 			var brunnel := str(f.tags.get("brunnel", ""))
 			var c := str(f.tags.get("class", ""))
-			if not (brunnel == "bridge" or brunnel == "tunnel") or not ROADS.has(c) or f.type != MVTDecoder.GEOM_LINE:
+			if not ROADS.has(c) or f.type != MVTDecoder.GEOM_LINE:
+				continue
+			if not (brunnel == "bridge" or brunnel == "tunnel"):
+				if ROADS[c][1] >= NETWORK_RANK and near.has_area() and not (str(f.tags.get("subclass", "")) in SKIP_PATHS):
+					var oneway := int(f.tags.get("oneway", 0))
+					for r: PackedVector2Array in f.rings:
+						for piece: PackedVector2Array in Geometry2D.intersect_polyline_with_polygon(_scale_ring(r, k), near_poly):
+							_neighbour_roads.append({pts = _translate(piece, shift), cls = c, oneway = oneway})
 				continue
 			var layer_tag := int(f.tags.get("layer", 1 if brunnel == "bridge" else 0))
 			for r: PackedVector2Array in f.rings:
@@ -299,10 +331,16 @@ func _classify() -> void:
 	# Roads: clip to the tile so neighbouring chunks don't draw the same piece twice.
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
 	var structures_by_key := {}  # "kind|class|layer" -> Array[PackedVector2Array]
-	var add_road := func(r: PackedVector2Array, c: String, sub := "") -> void:
+	var add_road := func(r: PackedVector2Array, c: String, sub := "", oneway := 0) -> void:
 		if ROADS[c][1] >= DRIVABLE_RANK:
 			_flatten_lines.append({pts = r, cls = c})
+		if ROADS[c][1] >= NETWORK_RANK and not _have_neighbours:
+			# No neighbour data: this tile's buffer is the only context past the seams.
+			for piece: PackedVector2Array in Geometry2D.clip_polyline_with_polygon(r, rect):
+				_net_lines.append({pts = piece, cls = c, oneway = oneway, own = false})
 		for piece: PackedVector2Array in Geometry2D.intersect_polyline_with_polygon(r, rect):
+			if ROADS[c][1] >= NETWORK_RANK and piece.size() >= 2:
+				_net_lines.append({pts = piece, cls = c, oneway = oneway, own = true})
 			if piece.size() >= 2:
 				_road_lines.append({pts = piece, cls = c, sub = sub, bridge = false, tunnel = false})
 				Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, piece,
@@ -325,7 +363,7 @@ func _classify() -> void:
 				structures_by_key[key].append_array(Geometry2D.intersect_polyline_with_polygon(r, rect))
 			continue
 		for r in _feature_rings("transportation", f):
-			add_road.call(r, c, sub)
+			add_road.call(r, c, sub, int(f.tags.get("oneway", 0)))
 	_collect_labels()
 	for s in _neighbour_structures:
 		var key := "%s|%s|%d" % [s.kind, s.cls, s.layer]
@@ -905,36 +943,100 @@ func _build_water_mesh() -> void:
 
 # --- Stage: roads --------------------------------------------------------------------
 
+## Half width for a road: OSM widths cover the travel lanes; urban side streets also
+## get parking lanes.
+func _road_hw(cls: String, pts: PackedVector2Array) -> float:
+	var spec: Array = ROADS[cls]
+	var hw: float = spec[0]
+	var rank: int = spec[1]
+	if (rank == 4 or rank == 5) and _urban_at(pts[pts.size() / 2]):
+		hw += 2.2
+	return hw
+
+
+## Pavements line urban streets from side streets up to primary roads.
+func _road_paved(cls: String, pts: PackedVector2Array) -> bool:
+	var rank: int = ROADS[cls][1]
+	return rank >= 4 and rank <= 7 and _urban_at(pts[pts.size() / 2])
+
+
+func _urban_at(p: Vector2) -> bool:
+	return _class_at(Vector2(clampf(p.x, 0.0, size), clampf(p.y, 0.0, size))) == Cls.URBAN
+
+
+## Lays out this tile's at-grade roads, junctions and roundabouts (see RoadNetwork).
+func _build_network() -> RoadNetwork:
+	var net := RoadNetwork.new()
+	net.size = size
+	net.region = region
+	net.left_hand = RegionStyle.left_hand_traffic(region)
+	net.north_america = region == RegionStyle.NORTH_AMERICA
+	net.uk = region == RegionStyle.UK
+	net.height_at = height_at
+	net.have_points = _osm_complete
+	for i in range(0, _osm_points.size() - 2, 3):
+		var p := Vector2((_osm_points[i] - _merc0[0]) * _scale, (_merc0[1] - _osm_points[i + 1]) * _scale)
+		if p.x > -RoadNetwork.MARGIN and p.y > -RoadNetwork.MARGIN and p.x < size + RoadNetwork.MARGIN 				and p.y < size + RoadNetwork.MARGIN:
+			net.points.append({pos = p, kind = int(_osm_points[i + 2])})
+	var add := func(line: Dictionary, own: bool, phantom: bool) -> void:
+		var spec: Array = ROADS[line.cls]
+		var pts: PackedVector2Array = line.pts
+		net.add_line(pts, line.cls, _road_hw(line.cls, pts) if not phantom else spec[0], spec[0], spec[1],
+			spec[2], spec[3], int(line.get("oneway", 0)), own, _road_paved(line.cls, pts) and not phantom, phantom)
+	for line in _net_lines:
+		add.call(line, line.own, false)
+	for line in _neighbour_roads:
+		add.call(line, false, false)
+	# Bridges and tunnels shape the junctions at their ends but are drawn separately.
+	for road in _road_lines:
+		if (road.bridge or road.tunnel) and ROADS[road.cls][1] >= NETWORK_RANK:
+			add.call(road, true, true)
+	net.build()
+	return net
+
+
 func _build_roads() -> void:
-	var verts := PackedVector3Array()
-	var uvs := PackedVector2Array()
-	var colors := PackedColorArray()
-	var indices := PackedInt32Array()
+	var net := _build_network()
+	var verts := net.verts
+	var uvs := net.uvs
+	var uv2s := net.uv2s
+	var colors := net.colors
+	var indices := net.indices
+	for item: Array in net.instances:
+		_add_instance(item[0], item[1])
+	_rings = net.ring_zones
+	_no_park.resize(MASK_RES * MASK_RES)
+	_no_park.fill(0)
+	for z: Dictionary in net.no_park:
+		Raster.stroke_polyline(_no_park, MASK_RES, MASK_RES, size / MASK_RES, z.pts, z.hw, 1)
+	road_stats = net.stats
+	signal_spots = net.signal_spots
 	for road_idx in _road_lines.size():
 		var road: Dictionary = _road_lines[road_idx]
 		var spec: Array = ROADS[road.cls]
 		var hw: float = spec[0]
 		var rank: int = spec[1]
 		var color: Color = spec[2]
-		color.a = spec[3] / 2.0
+		var style := 0 if spec[3] == 0 else (1 if spec[3] == 1 else 17)
 		var structure: bool = road.bridge or road.tunnel
 		var pts: PackedVector2Array = road.pts if structure else _resample(road.pts, 3.0)
 		if pts.size() < 2:
 			continue
+		# At-grade roads are drawn by the network; here they only get props and spawns.
+		var networked := not structure and rank >= NETWORK_RANK
 		if road.cls == "path":
 			var ps := _path_style(road.get("sub", ""), _class_at(pts[pts.size() / 2]) == Cls.URBAN)
 			hw = ps[0]
 			color = ps[1]
-			color.a = 0.0
-		# OSM widths cover the travel lanes; urban side streets also get parking lanes.
-		if not structure and (rank == 4 or rank == 5) and _class_at(pts[pts.size() / 2]) == Cls.URBAN:
-			hw += 2.2
-		# Extend free ends (not on the tile border) to cover gaps at junctions.
+			style = 0
+		if not structure:
+			hw = _road_hw(road.cls, road.pts) if networked else hw
+		# Extend free ends of paths and tracks (not on the tile border) over junction gaps.
 		var first_dir := (pts[1] - pts[0]).normalized()
 		var last_dir := (pts[pts.size() - 1] - pts[pts.size() - 2]).normalized()
-		if not structure and not _on_border(pts[0]):
+		if not structure and not networked and not _on_border(pts[0]):
 			pts.insert(0, pts[0] - first_dir * hw * 0.8)
-		if not structure and not _on_border(pts[pts.size() - 1]):
+		if not structure and not networked and not _on_border(pts[pts.size() - 1]):
 			pts.append(pts[pts.size() - 1] + last_dir * hw * 0.8)
 		var lift := 0.12 + rank * 0.025
 		var heights := PackedFloat32Array()
@@ -950,6 +1052,9 @@ func _build_roads() -> void:
 			for k in pts.size():
 				heights[k] = minf(road.heights[k], height_at(pts[k])) + lift
 			_build_tunnel(pts, heights, hw)
+		elif networked:
+			for k in pts.size():  # only for spawns and props: the network draws these
+				heights[k] = height_at(pts[k]) + lift
 		else:
 			# Sit on the highest of centre and both edges so terrain can't poke through.
 			for k in pts.size():
@@ -959,6 +1064,7 @@ func _build_roads() -> void:
 		var base := verts.size()
 		var along := 0.0
 		var spawn_pts := PackedVector3Array()
+		var uv2 := Vector2(hw, style)
 		for k in pts.size():
 			var dir: Vector2
 			if k == 0:
@@ -972,12 +1078,15 @@ func _build_roads() -> void:
 			if k > 0:
 				along += pts[k].distance_to(pts[k - 1])
 			var y := heights[k]
+			spawn_pts.append(Vector3(pts[k].x, y, pts[k].y))
+			if networked:
+				continue
 			var l := Vector3(pts[k].x + nrm.x, y, pts[k].y + nrm.y)
 			var r := Vector3(pts[k].x - nrm.x, y, pts[k].y - nrm.y)
 			verts.append_array([l, r])
 			uvs.append_array([Vector2(0, along), Vector2(1, along)])
+			uv2s.append_array([uv2, uv2])
 			colors.append_array([color, color])
-			spawn_pts.append(Vector3(pts[k].x, y, pts[k].y))
 			if k > 0:
 				var a := base + (k - 1) * 2
 				indices.append_array([a, a + 1, a + 2, a + 1, a + 3, a + 2])
@@ -987,10 +1096,15 @@ func _build_roads() -> void:
 		if rank >= DRIVABLE_RANK and not road.tunnel:
 			road_spawn.append({pts = spawn_pts, rank = rank})
 		if rank >= 6 and not structure:
-			_place_lamps(pts, heights, hw, lift)
+			_place_lamps(pts, heights, hw, lift, _road_paved(road.cls, road.pts))
 		if not structure:
 			_place_street_props(pts, heights, hw, lift, rank, road_idx)
-	roads = {vertices = verts, uvs = uvs, colors = colors, indices = indices}
+	roads = {vertices = verts, uvs = uvs, uv2s = uv2s, colors = colors, indices = indices}
+	# Keep trees off the pavements (props above are placed before this).
+	var mask_cell := size / MASK_RES
+	for p: Dictionary in net.paved:
+		Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, p.pts, p.hw + RoadNetwork.PAVEMENT + 0.5, 3)
+
 	_cut_portal_collision()
 	structures = {vertices = _s_verts, normals = _s_normals, colors = _s_colors,
 		uvs = _s_uvs, uv2s = _s_uv2s}
@@ -1238,7 +1352,8 @@ func _add_tunnel_box(pts: PackedVector2Array, heights: PackedFloat32Array, i0: i
 
 
 ## Street lamps on alternating sides; the model's arm points along +x.
-func _place_lamps(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float, lift: float) -> void:
+func _place_lamps(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float, lift: float,
+		paved: bool) -> void:
 	const SPACING := 45.0
 	var next := SPACING * 0.5
 	var along := 0.0
@@ -1255,11 +1370,12 @@ func _place_lamps(pts: PackedVector2Array, heights: PackedFloat32Array, hw: floa
 		var p := pts[k] + nrm * (hw + 1.2)
 		var arm := -Vector3(nrm.x, 0, nrm.y)  # towards the road centre
 		var basis := Basis(arm, Vector3.UP, arm.cross(Vector3.UP))
-		_add_instance("lamp_road", Transform3D(basis, Vector3(p.x, heights[k] - lift, p.y)))
+		var y := heights[k] + RoadNetwork.KERB if paved else heights[k] - lift
+		_add_instance("lamp_road", Transform3D(basis, Vector3(p.x, y, p.y)))
 
 
-## Parked cars along urban side streets, street furniture on the pavement and stop
-## signs where minor roads end at a junction.
+## Parked cars along urban side streets and street furniture on the pavement. (Junction
+## signs and signals come from RoadNetwork.)
 func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float,
 		lift: float, rank: int, road_idx: int) -> void:
 	var rng := RandomNumberGenerator.new()
@@ -1290,7 +1406,7 @@ func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, h
 					var fwd: Vector2 = s[1]
 					var nrm := Vector2(-fwd.y, fwd.x) * side
 					var p: Vector2 = s[0] + nrm * (hw - 1.1)
-					if not _near_other_road(p, road_idx, 4.0):
+					if not _near_other_road(p, road_idx, 4.0) and not _on_roundabout(p) and not _near_junction(p):
 						var facing := fwd * side * (-1.0 if RegionStyle.left_hand_traffic(region) else 1.0)
 						_add_instance(RegionStyle.parked_car_role(region), _facing(Vector3(p.x, s[2] + lift, p.y), facing))
 				d += rng.randf_range(6.5, 9.0)
@@ -1302,23 +1418,11 @@ func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, h
 			var fwd: Vector2 = s[1]
 			var side := 1.0 if rng.randf() < 0.5 else -1.0
 			var nrm := Vector2(-fwd.y, fwd.x) * side
-			var p: Vector2 = s[0] + nrm * (hw + 2.6)
-			if free_spot.call(p):
-				_add_instance(RegionStyle.street_furniture_role(region), _facing(Vector3(p.x, height_at(p), p.y), -nrm))
+			var p: Vector2 = s[0] + nrm * (hw + 1.4)
+			if free_spot.call(p + nrm * 0.8) and not _on_roundabout(p):
+				var y: float = s[2] + lift + RoadNetwork.KERB  # on the pavement
+				_add_instance(RegionStyle.street_furniture_role(region), _facing(Vector3(p.x, y, p.y), -nrm))
 			d += rng.randf_range(15.0, 35.0)
-	# Stop signs at junction ends of minor roads (ends not on the tile border).
-	if (rank == 3 or rank == 4) and total > 25.0:
-		for end in [0, 1]:
-			var e := pts[0] if end == 0 else pts[pts.size() - 1]
-			if _on_border(e):
-				continue
-			var s: Array = sample.call(4.0 if end == 0 else total - 4.0)
-			var fwd: Vector2 = s[1]
-			var toward := -fwd if end == 0 else fwd  # direction of travel into the junction
-			var right := Vector2(-toward.y, toward.x)
-			var p: Vector2 = s[0] + right * (hw + 1.0)
-			if free_spot.call(p):
-				_add_instance("sign_stop", _facing(Vector3(p.x, height_at(p), p.y), -toward))
 
 
 ## Transform at `pos` whose +Z (the pack models' front) points along `dir`.
@@ -1344,6 +1448,20 @@ func _add_instance(role: String, xf: Transform3D) -> void:
 	if not bucket.has(role):
 		bucket[role] = []
 	bucket[role].append(xf)
+
+
+func _near_junction(p: Vector2) -> bool:
+	var mask_cell := size / MASK_RES
+	var i := clampi(int(p.x / mask_cell), 0, MASK_RES - 1)
+	var j := clampi(int(p.y / mask_cell), 0, MASK_RES - 1)
+	return _no_park[j * MASK_RES + i] != 0
+
+
+func _on_roundabout(p: Vector2) -> bool:
+	for r in _rings:
+		if p.distance_to(Vector2(r.x, r.y)) < r.z + 4.0:
+			return true
+	return false
 
 
 func _on_border(p: Vector2) -> bool:

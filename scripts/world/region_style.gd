@@ -74,3 +74,9 @@ static func street_furniture_role(region: String) -> String:
 
 static func left_hand_traffic(region: String) -> bool:
 	return region == UK or region == JAPAN or region == OCEANIA
+
+
+## North America hangs signals over the road from mast arms; elsewhere they sit on
+## short poles at the kerb.
+static func traffic_light_role(region: String) -> String:
+	return "traffic_light" if region == NORTH_AMERICA else "traffic_light_pole"

@@ -23,6 +23,7 @@ var _heights := PackedFloat32Array()  # terrain grid, for height queries
 var _grid_n := 0
 var _grid_cell := 1.0
 var ready_for_physics := false
+var osm_complete := false  ## built with Overpass junction data (see OsmPoints)
 
 var _builder: ChunkBuilder
 var _finalize_step := 0
@@ -48,6 +49,7 @@ func setup(builder: ChunkBuilder) -> void:
 	_builder = builder
 	tile = builder.tile
 	lod = builder.lod
+	osm_complete = builder.osm_complete
 	size = builder.size
 	name = "Chunk_%d_%d_%s" % [tile.x, tile.y, "full" if lod == ChunkBuilder.Lod.FULL else "far"]
 
@@ -264,7 +266,7 @@ func _add_scatter_block(bucket: Dictionary) -> void:
 				_add_boxes(list, variants[v].aabb)
 			var mmi := MultiMeshInstance3D.new()
 			mmi.multimesh = mm
-			mmi.material_override = Catalog.atlas_material
+			mmi.material_override = variants[v].get("material", Catalog.atlas_material)
 			mmi.visibility_range_end = Catalog.VISIBILITY.get(role, Catalog.DEFAULT_VISIBILITY)
 			mmi.visibility_range_end_margin = 50.0
 			mmi.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED
