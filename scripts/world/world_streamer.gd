@@ -89,6 +89,44 @@ func in_tunnel(global_pos: Vector3) -> bool:
 	return c.terrain_height(Vector2(local.x, local.z)) > global_pos.y + 0.3
 
 
+const AREA_CLASSES := ["suburb", "quarter", "neighbourhood", "village", "hamlet", "isolated_dwelling"]
+const SETTLEMENT_CLASSES := ["city", "town", "village"]
+
+
+## Where the position is: {road, area, settlement}. Road is the nearest named road
+## within 25 m; area the nearest suburb/neighbourhood point; settlement the nearest
+## city/town among loaded chunks (may be empty).
+func describe(global_pos: Vector3) -> Dictionary:
+	var out := {road = "", area = "", settlement = ""}
+	var best_road := 25.0
+	var best_area := 2500.0
+	var best_town := INF
+	var t := Geo.local_to_tile(global_pos, Geo.CHUNK_ZOOM)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var c: Chunk = _chunks.get(t + Vector2i(dx, dy))
+			if c == null:
+				continue
+			var local := global_pos - c.position
+			var p := Vector2(local.x, local.z)
+			for r: Dictionary in c.road_names:
+				var pts: PackedVector2Array = r.pts
+				for k in range(1, pts.size()):
+					var d := p.distance_to(Geometry2D.get_closest_point_to_segment(p, pts[k - 1], pts[k]))
+					if d < best_road:
+						best_road = d
+						out.road = r.name if r.ref.is_empty() else ("%s (%s)" % [r.name, r.ref] if not r.name.is_empty() else r.ref)
+			for pl: Dictionary in c.places:
+				var d: float = p.distance_to(pl.pos)
+				if pl.cls in AREA_CLASSES and d < best_area:
+					best_area = d
+					out.area = pl.name
+				if pl.cls in SETTLEMENT_CLASSES and d < best_town:
+					best_town = d
+					out.settlement = pl.name
+	return out
+
+
 func is_loading() -> bool:
 	return not _jobs.is_empty()
 

@@ -11,6 +11,10 @@ const MINIMAP_SPAN := 700.0  # metres shown across
 @export var streamer: WorldStreamer
 
 var _speed_label: Label
+var _road_label: Label
+var _area_label: Label
+var _settlement := ""
+var _describe_timer := 0.0
 var _info_label: Label
 var _status_label: Label
 var _search: LineEdit
@@ -33,10 +37,14 @@ func _build_info() -> void:
 	box.position = Vector2(16, 12)
 	add_child(box)
 	_speed_label = _label(36)
-	_info_label = _label(14)
+	_road_label = _label(20)
+	_area_label = _label(15)
+	_area_label.modulate = Color(1, 1, 1, 0.85)
+	_info_label = _label(13)
+	_info_label.modulate = Color(1, 1, 1, 0.7)
 	_status_label = _label(16)
 	_status_label.modulate = Color(1, 0.9, 0.5)
-	for l in [_speed_label, _info_label, _status_label]:
+	for l in [_speed_label, _road_label, _area_label, _info_label, _status_label]:
 		box.add_child(l)
 
 
@@ -138,9 +146,21 @@ func _unhandled_input(event: InputEvent) -> void:
 		_search.release_focus()
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if car == null:
 		return
+	_describe_timer -= delta
+	if _describe_timer <= 0.0 and streamer:
+		_describe_timer = 0.25
+		var where := streamer.describe(car.global_position)
+		if not where.settlement.is_empty():
+			_settlement = where.settlement  # keep the last town seen; it may be out of range
+		_road_label.text = where.road
+		var parts := []
+		for s: String in [where.area, _settlement]:
+			if not s.is_empty() and not parts.has(s):
+				parts.append(s)
+		_area_label.text = " · ".join(parts)
 	_speed_label.text = "%d km/h" % roundi(absf(car.speed_kmh()))
 	var ll := Geo.local_to_latlon(car.global_position)
 	_info_label.text = "%.5f, %.5f   alt %d m   %d fps" % [ll.x, ll.y, roundi(car.global_position.y),
@@ -199,6 +219,7 @@ func _on_result(index: int) -> void:
 
 
 func _go(lat: float, lon: float, label: String) -> void:
+	_settlement = ""
 	_results.visible = false
 	_search.release_focus()
 	teleport_requested.emit(lat, lon, label)

@@ -7,7 +7,8 @@ extends RefCounted
 
 enum Lod { FULL, HORIZON }
 
-const LAYERS := ["transportation", "building", "water", "waterway", "landcover", "landuse", "park"]
+const LAYERS := ["transportation", "building", "water", "waterway", "landcover", "landuse", "park",
+	"transportation_name", "place"]
 const MASK_RES := 512  # Fine exclusion mask (roads, buildings, water) for scatter.
 const BLOCKS := 4  # Scatter is split into BLOCKS x BLOCKS sub-chunks for culling.
 
@@ -46,12 +47,56 @@ const ROADS := {
 	"path": [0.9, 1, Color(0.74, 0.67, 0.54), 0],
 }
 const DRIVABLE_RANK := 2  # Spawn/flatten only on roads at least this rank.
+const SKIP_PATHS := ["corridor", "platform", "elevator"]  # indoor / station platforms
+const PAVING := Color(0.66, 0.65, 0.62)
+const DIRT := Color(0.62, 0.55, 0.42)
+
+
+## Paths by OSM subclass: [half width, colour]. In towns footways are paving, not dirt.
+func _path_style(sub: String, urban: bool) -> Array:
+	match sub:
+		"pedestrian":
+			return [2.6, Color(0.72, 0.70, 0.65)]
+		"cycleway":
+			return [1.0, Color(0.50, 0.40, 0.38)]
+		"steps":
+			return [0.9, Color(0.62, 0.61, 0.58)]
+	return [0.8, PAVING if urban else DIRT]
+
+
+## Street names and place points, for the HUD's "where am I" line.
+func _collect_labels() -> void:
+	var k := _to_local("transportation_name") if _layers.has("transportation_name") else 1.0
+	for f: Dictionary in _features("transportation_name"):
+		var name := _label(f.tags)
+		var ref := str(f.tags.get("ref", ""))
+		if name.is_empty() and ref.is_empty():
+			continue
+		for r: PackedVector2Array in f.rings:
+			road_names.append({pts = _scale_ring(r, k), name = name, ref = ref})
+	var kp := _to_local("place") if _layers.has("place") else 1.0
+	for f: Dictionary in _features("place"):
+		var name := _label(f.tags)
+		if name.is_empty() or f.rings.is_empty() or f.rings[0].is_empty():
+			continue
+		places.append({pos = f.rings[0][0] * kp, name = name, cls = str(f.tags.get("class", ""))})
+
+
+## Latin-script name: English, then the international (transliterated) name.
+static func _label(tags: Dictionary) -> String:
+	for key in ["name_en", "name:en", "name_int", "name"]:
+		var v := str(tags.get(key, ""))
+		if not v.is_empty():
+			return v
+	return ""
 
 # Inputs
 var tile: Vector2i
 var lod: Lod
 var size: float  # tile edge in true metres
 var latitude: float
+var longitude: float
+var region: String  ## see RegionStyle
 var _mvt_bytes: PackedByteArray
 var _neighbour_bytes := {}  # Vector2i offset -> PackedByteArray (8 surrounding tiles)
 ## Bridge/tunnel lines from the surrounding tiles, in this chunk's space:
@@ -85,6 +130,8 @@ var collision := {}  # {heights: PackedFloat32Array, width: int, cell: float}
 var water := {}
 var roads := {}
 var road_spawn: Array[Dictionary] = []  # {pts: PackedVector3Array, rank: int}
+var road_names: Array[Dictionary] = []  # {pts: PackedVector2Array, name: String, ref: String}
+var places: Array[Dictionary] = []  # {pos: Vector2, name: String, cls: String}
 ## Collision faces for bridge decks/railings and tunnel floors/walls.
 var structure_faces := PackedVector3Array()
 ## Concrete for bridge slabs, railings, pillars and tunnel tubes (building shader, no windows).
@@ -115,6 +162,8 @@ func _init(p_tile: Vector2i, p_lod: Lod, mvt: PackedByteArray, elev: ElevationSo
 	size = Geo.tile_size_merc(Geo.CHUNK_ZOOM) * _scale
 	var ll := Geo.merc_to_lonlat(_merc0[0], _merc0[1])
 	latitude = ll[1]
+	longitude = ll[0]
+	region = RegionStyle.region_for(latitude, longitude)
 	_n = 129 if lod == Lod.FULL else 33
 	_cell = size / (_n - 1)
 	_seed = hash(tile)
@@ -250,17 +299,21 @@ func _classify() -> void:
 	# Roads: clip to the tile so neighbouring chunks don't draw the same piece twice.
 	var rect := PackedVector2Array([Vector2.ZERO, Vector2(size, 0), Vector2(size, size), Vector2(0, size)])
 	var structures_by_key := {}  # "kind|class|layer" -> Array[PackedVector2Array]
-	var add_road := func(r: PackedVector2Array, c: String) -> void:
+	var add_road := func(r: PackedVector2Array, c: String, sub := "") -> void:
 		if ROADS[c][1] >= DRIVABLE_RANK:
 			_flatten_lines.append({pts = r, cls = c})
 		for piece: PackedVector2Array in Geometry2D.intersect_polyline_with_polygon(r, rect):
 			if piece.size() >= 2:
-				_road_lines.append({pts = piece, cls = c, bridge = false, tunnel = false})
+				_road_lines.append({pts = piece, cls = c, sub = sub, bridge = false, tunnel = false})
 				Raster.stroke_polyline(_mask, MASK_RES, MASK_RES, mask_cell, piece,
 					ROADS[c][0] + 1.5, 3)
 	for f: Dictionary in _features("transportation"):
 		var c := str(f.tags.get("class", ""))
-		if not ROADS.has(c) or f.type != MVTDecoder.GEOM_LINE:
+		var sub := str(f.tags.get("subclass", ""))
+		if c == "path" and f.type == MVTDecoder.GEOM_POLYGON:
+			paint.call("transportation", f, Cls.URBAN)  # pedestrian squares, platforms: paving
+			continue
+		if not ROADS.has(c) or f.type != MVTDecoder.GEOM_LINE or sub in SKIP_PATHS:
 			continue
 		var brunnel := str(f.tags.get("brunnel", ""))
 		if brunnel == "bridge" or brunnel == "tunnel":
@@ -272,7 +325,8 @@ func _classify() -> void:
 				structures_by_key[key].append_array(Geometry2D.intersect_polyline_with_polygon(r, rect))
 			continue
 		for r in _feature_rings("transportation", f):
-			add_road.call(r, c)
+			add_road.call(r, c, sub)
+	_collect_labels()
 	for s in _neighbour_structures:
 		var key := "%s|%s|%d" % [s.kind, s.cls, s.layer]
 		if not structures_by_key.has(key):
@@ -867,6 +921,11 @@ func _build_roads() -> void:
 		var pts: PackedVector2Array = road.pts if structure else _resample(road.pts, 3.0)
 		if pts.size() < 2:
 			continue
+		if road.cls == "path":
+			var ps := _path_style(road.get("sub", ""), _class_at(pts[pts.size() / 2]) == Cls.URBAN)
+			hw = ps[0]
+			color = ps[1]
+			color.a = 0.0
 		# OSM widths cover the travel lanes; urban side streets also get parking lanes.
 		if not structure and (rank == 4 or rank == 5) and _class_at(pts[pts.size() / 2]) == Cls.URBAN:
 			hw += 2.2
@@ -1232,7 +1291,8 @@ func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, h
 					var nrm := Vector2(-fwd.y, fwd.x) * side
 					var p: Vector2 = s[0] + nrm * (hw - 1.1)
 					if not _near_other_road(p, road_idx, 4.0):
-						_add_instance("parked_car", _facing(Vector3(p.x, s[2] + lift, p.y), fwd * side))
+						var facing := fwd * side * (-1.0 if RegionStyle.left_hand_traffic(region) else 1.0)
+						_add_instance(RegionStyle.parked_car_role(region), _facing(Vector3(p.x, s[2] + lift, p.y), facing))
 				d += rng.randf_range(6.5, 9.0)
 	# Hydrants, bins, benches and mailboxes on the pavement.
 	if urban and rank >= 4 and rank <= 7:
@@ -1244,7 +1304,7 @@ func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, h
 			var nrm := Vector2(-fwd.y, fwd.x) * side
 			var p: Vector2 = s[0] + nrm * (hw + 2.6)
 			if free_spot.call(p):
-				_add_instance("street_furniture", _facing(Vector3(p.x, height_at(p), p.y), -nrm))
+				_add_instance(RegionStyle.street_furniture_role(region), _facing(Vector3(p.x, height_at(p), p.y), -nrm))
 			d += rng.randf_range(15.0, 35.0)
 	# Stop signs at junction ends of minor roads (ends not on the tile border).
 	if (rank == 3 or rank == 4) and total > 25.0:
@@ -1329,7 +1389,7 @@ func _build_buildings() -> void:
 			for piece: PackedVector2Array in Geometry2D.intersect_polygons(poly, rect):
 				if absf(MVTDecoder.ring_area(piece)) < 12.0:
 					continue
-				var color: Color = BUILDING_COLORS[key % BUILDING_COLORS.size()]
+				var color := RegionStyle.wall_colour(region, height, key)
 				if osm_colour != null:
 					color = osm_colour
 				_extrude(piece, min_h, height, color, key, verts, normals, colors, uvs, uv2s)
@@ -1435,7 +1495,8 @@ func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Colo
 	var ground := minf(g_max, g_min + 6.0)
 	var bottom := (g_min - 2.0) if min_h == 0.0 else ground + min_h
 	var top := ground + height
-	var roof := color.darkened(0.35)
+	var regional_roof: Variant = RegionStyle.roof_colour(region, height)
+	var roof: Color = regional_roof if regional_roof != null else color.darkened(0.35)
 	roof.a = 0.0
 	color.a = 1.0
 	var info := Vector2(height - min_h, (key % 1000) / 1000.0)

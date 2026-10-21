@@ -14,6 +14,8 @@ var tile: Vector2i
 var lod: ChunkBuilder.Lod
 var size := 0.0
 var road_spawn: Array[Dictionary] = []
+var road_names: Array[Dictionary] = []  ## see ChunkBuilder.road_names
+var places: Array[Dictionary] = []
 var tunnel_boxes: Array[Transform3D] = []  ## see ChunkBuilder.tunnel_boxes
 var portal_boxes: Array[Transform3D] = []
 var _tunnel_inverse: Array[Transform3D] = []
@@ -74,6 +76,8 @@ func finalize_step() -> bool:
 				var roads := _add_mesh("Roads", _array_mesh(b.roads, true), road_material, 1 | MINIMAP_LAYER)
 				roads.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 			road_spawn = b.road_spawn
+			road_names = b.road_names
+			places = b.places
 			_add_trimesh("StructureCollision", b.structure_faces)
 			if not b.structures.is_empty() and b.structures.vertices.size() > 0:
 				_add_mesh("Structures", _array_mesh(b.structures, false), building_material, 1)

@@ -19,13 +19,19 @@ const ROLES := {
 		"vehicles/jeep-open", "vehicles/car-veteran", "vehicles/car-police"],
 	"street_furniture": ["props/fire-hydrant", "props/trash-can", "props/mail-box",
 		"props/bin-wheelie", "props/bench-old", "props/bike-stand"],
+	# Outside North America: no yellow cabs, police cruisers, hydrants or US mailboxes.
+	# Listed more than once to weight the mix towards ordinary saloons.
+	"parked_car_intl": ["vehicles/car-passenger", "vehicles/car-passenger", "vehicles/car-passenger",
+		"vehicles/car-hippie-van", "vehicles/jeep-open"],
+	"street_furniture_intl": ["props/trash-can", "props/bench-old", "props/bin-wheelie",
+		"props/bike-stand"],
 	"park_furniture": ["props/bench-forest", "props/trash-can"],
 	"sign_stop": ["props/traffic-sign-stop"],
 }
 ## Roles that get box colliders, and how far away each role stays visible.
-const SOLID_ROLES := ["parked_car", "lamp_road"]
-const VISIBILITY := {"street_furniture": 250.0, "park_furniture": 300.0, "sign_stop": 300.0,
-	"parked_car": 450.0}
+const SOLID_ROLES := ["parked_car", "parked_car_intl", "lamp_road"]
+const VISIBILITY := {"street_furniture": 250.0, "street_furniture_intl": 250.0,
+	"park_furniture": 300.0, "sign_stop": 300.0, "parked_car": 450.0, "parked_car_intl": 450.0}
 const DEFAULT_VISIBILITY := 900.0
 
 var atlas_material: StandardMaterial3D
