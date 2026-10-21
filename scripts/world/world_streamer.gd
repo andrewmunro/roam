@@ -13,7 +13,7 @@ const UNLOAD_RADIUS := 3
 const REBASE_DISTANCE := 2000.0
 const FRAME_BUDGET_USEC := 4000
 ## Longest a full chunk waits for Overpass junction data before guessing instead.
-const OSM_WAIT := 5.0
+const OSM_WAIT := 1.0  # then build with guessed signals; real data rebuilds the chunk later
 
 @export var target: Node3D
 
