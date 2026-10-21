@@ -106,6 +106,21 @@ func _setup_collision(model: Node3D) -> void:
 	cs.shape = shape
 	cs.position = Vector3(box.get_center().x, (top + bottom) * 0.5, box.get_center().z)
 	add_child(cs)
+	# Sensor for street furniture: lamps and signs get knocked over instead of acting as walls.
+	var sensor := Area3D.new()
+	sensor.name = "KnockSensor"
+	sensor.collision_layer = 0
+	sensor.collision_mask = Knockables.KNOCK_LAYER
+	sensor.monitorable = false
+	var scs := CollisionShape3D.new()
+	var sshape := BoxShape3D.new()
+	sshape.size = Vector3(box.size.x, box.size.y, box.size.z) * 1.02
+	scs.shape = sshape
+	scs.position = box.get_center()
+	sensor.add_child(scs)
+	sensor.body_shape_entered.connect(func(_rid: RID, body: Node3D, shape: int, _local: int) -> void:
+		Knockables.knock(body, shape, self))
+	add_child(sensor)
 
 
 func _physics_process(delta: float) -> void:

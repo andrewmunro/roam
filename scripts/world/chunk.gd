@@ -87,12 +87,16 @@ func finalize_step() -> bool:
 			if not b.buildings.is_empty() and b.buildings.vertices.size() > 0:
 				_add_mesh("Buildings", _array_mesh(b.buildings, false), building_material, 1)
 		3:
-			# Building collision is the slowest upload; spread blocks over frames.
+			# Building and road collision are the slowest uploads; spread blocks over frames.
 			var start := Time.get_ticks_usec()
-			while _collision_block < b.building_faces.size() and Time.get_ticks_usec() - start < 4000:
-				_add_trimesh("BuildingCollision", b.building_faces[_collision_block])
+			var blocks := maxi(b.building_faces.size(), b.road_faces.size())
+			while _collision_block < blocks and Time.get_ticks_usec() - start < 4000:
+				if _collision_block < b.building_faces.size():
+					_add_trimesh("BuildingCollision", b.building_faces[_collision_block])
+				if _collision_block < b.road_faces.size():
+					_add_trimesh("RoadCollision", b.road_faces[_collision_block])
 				_collision_block += 1
-			if _collision_block < b.building_faces.size():
+			if _collision_block < blocks:
 				return false
 		4:
 			var start := Time.get_ticks_usec()
@@ -132,6 +136,23 @@ func in_tunnel_box(local_pos: Vector3) -> bool:
 		if absf(p.x) <= 1.0 and absf(p.y) <= 1.0 and absf(p.z) <= 1.0:
 			return true
 	return false
+
+
+## This chunk's terrain heights along one edge ("w", "e", "n", "s"), for pinning a
+## neighbour's matching edge (see ChunkBuilder.edge_pins).
+func edge_heights(side: String) -> PackedFloat32Array:
+	var out := PackedFloat32Array()
+	if _heights.is_empty():
+		return out
+	var n := _grid_n
+	out.resize(n)
+	for k in n:
+		match side:
+			"w": out[k] = _heights[k * n]
+			"e": out[k] = _heights[k * n + n - 1]
+			"n": out[k] = _heights[k]
+			_: out[k] = _heights[(n - 1) * n + k]
+	return out
 
 
 ## Terrain height at a chunk-local x/z, on the same triangles as ChunkBuilder.height_at.
@@ -206,6 +227,8 @@ func _add_heightmap(c: Dictionary) -> void:
 	cs.scale = Vector3(cell, cell, cell)
 	body.add_child(cs)
 	add_child(body)
+	if not _builder.terrain_patch_faces.is_empty():
+		_add_trimesh("TerrainPatchCollision", _builder.terrain_patch_faces, 1 << (TERRAIN_LAYER - 1))
 
 
 ## One static body holding a box per instance (shared shape per mesh variant).
@@ -220,8 +243,6 @@ func _add_boxes(xfs: Array, aabb: AABB) -> void:
 		cs.transform = xf * Transform3D(Basis.IDENTITY, aabb.get_center())
 		body.add_child(cs)
 	add_child(body)
-	if not _builder.terrain_patch_faces.is_empty():
-		_add_trimesh("TerrainPatchCollision", _builder.terrain_patch_faces, 1 << (TERRAIN_LAYER - 1))
 
 
 func _add_trimesh(node_name: String, faces: PackedVector3Array, layer := 1) -> void:
@@ -262,11 +283,14 @@ func _add_scatter_block(bucket: Dictionary) -> void:
 			mm.instance_count = list.size()
 			for k in list.size():
 				mm.set_instance_transform(k, list[k])
-			if role in Catalog.SOLID_ROLES:
+			var material: Material = variants[v].get("material", Catalog.atlas_material)
+			if role in Catalog.KNOCKABLE_ROLES:
+				Knockables.add_sensors(self, role, mm, list, variants[v].aabb, material)
+			elif role in Catalog.SOLID_ROLES:
 				_add_boxes(list, variants[v].aabb)
 			var mmi := MultiMeshInstance3D.new()
 			mmi.multimesh = mm
-			mmi.material_override = variants[v].get("material", Catalog.atlas_material)
+			mmi.material_override = material
 			mmi.visibility_range_end = Catalog.VISIBILITY.get(role, Catalog.DEFAULT_VISIBILITY)
 			mmi.visibility_range_end_margin = 50.0
 			mmi.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED

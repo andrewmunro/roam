@@ -141,6 +141,12 @@ var terrain := {}  # {vertices, colors, indices}
 var collision := {}  # {heights: PackedFloat32Array, width: int, cell: float}
 var water := {}
 var roads := {}
+## Road surface triangles per scatter block, for collision (the car drives on the
+## drawn road, which sits a little above the terrain).
+var road_faces: Array[PackedVector3Array] = []
+## Terrain heights of already-built neighbours along the shared edges: side ("w", "e",
+## "n", "s") -> PackedFloat32Array of _n values. This chunk's edges are pinned to them.
+var edge_pins := {}
 var road_spawn: Array[Dictionary] = []  # {pts: PackedVector3Array, rank: int}
 var road_names: Array[Dictionary] = []  # {pts: PackedVector2Array, name: String, ref: String}
 var road_stats := {}  ## RoadNetwork.stats: junction, roundabout and signal counts
@@ -196,7 +202,7 @@ func _init(p_tile: Vector2i, p_lod: Lod, mvt: PackedByteArray, elev: ElevationSo
 func step() -> bool:
 	var stages: Array[Callable]
 	if lod == Lod.FULL:
-		stages = [_decode, _classify, _sample_heights, _water, _flatten_roads,
+		stages = [_decode, _classify, _sample_heights, _water, _flatten_roads, _pin_edges,
 			_build_terrain, _build_roads, _build_buildings, _build_scatter]
 	else:
 		stages = [_sample_heights, _build_terrain]
@@ -743,6 +749,89 @@ func _masked_near(i: int, j: int) -> bool:
 
 # --- Stage: road flattening ---------------------------------------------------------
 
+## Splits the road mesh's triangles into scatter blocks for incremental upload.
+func _collect_road_faces(verts: PackedVector3Array, indices: PackedInt32Array) -> void:
+	road_faces.resize(BLOCKS * BLOCKS)
+	var bs := size / BLOCKS
+	for t in range(0, indices.size(), 3):
+		var a := verts[indices[t]]
+		var b := verts[indices[t + 1]]
+		var c := verts[indices[t + 2]]
+		# Only the drivable top: kerb and edge faces would be walls the car snags on,
+		# while the wheel rays step up onto the surface by themselves.
+		var nrm := (b - a).cross(c - a)
+		if absf(nrm.y) < 0.6 * nrm.length():
+			continue
+		var m := (a + b + c) / 3.0
+		var block := clampi(int(m.z / bs), 0, BLOCKS - 1) * BLOCKS + clampi(int(m.x / bs), 0, BLOCKS - 1)
+		road_faces[block].append_array([a, b, c])
+
+
+const PIN_BAND := 7  # cells over which a pinned edge blends back into this chunk's own terrain
+
+
+## Makes shared edges match already-built neighbours exactly. Each tile only sees its own
+## data, so flattening, water and smoothing can disagree by metres at a seam; the
+## difference is spread smoothly over PIN_BAND cells (relaxation with the pinned edges
+## fixed, zero beyond the band, free along unpinned edges).
+func _pin_edges() -> void:
+	if edge_pins.is_empty():
+		return
+	var n := _n
+	var delta := PackedFloat32Array()
+	delta.resize(n * n)
+	delta.fill(0.0)
+	var fixed := PackedByteArray()
+	fixed.resize(n * n)
+	fixed.fill(0)
+	var dist := PackedInt32Array()  # cells to the nearest pinned edge
+	dist.resize(n * n)
+	dist.fill(1 << 20)
+	for side: String in edge_pins:
+		var pins: PackedFloat32Array = edge_pins[side]
+		for k in n:
+			var v := _edge_vertex(side, k, 0)
+			delta[v] = pins[k] - _h[v]
+			fixed[v] = 1
+			for d in PIN_BAND + 1:
+				var w := _edge_vertex(side, k, d)
+				dist[w] = mini(dist[w], d)
+	var band: PackedInt32Array = []
+	for v in n * n:
+		if fixed[v] == 0 and dist[v] <= PIN_BAND:
+			band.append(v)
+	for it in 3 * PIN_BAND * PIN_BAND:
+		for v in band:
+			var i := v % n
+			var j := v / n
+			var sum := 0.0
+			var cnt := 0
+			if i > 0:
+				sum += delta[v - 1]
+				cnt += 1
+			if i < n - 1:
+				sum += delta[v + 1]
+				cnt += 1
+			if j > 0:
+				sum += delta[v - n]
+				cnt += 1
+			if j < n - 1:
+				sum += delta[v + n]
+				cnt += 1
+			delta[v] = lerpf(delta[v], sum / cnt, 1.5)  # over-relaxed
+	for v in n * n:
+		_h[v] += delta[v]
+
+
+## Vertex index `depth` cells in from an edge, `k` along it.
+func _edge_vertex(side: String, k: int, depth: int) -> int:
+	match side:
+		"w": return k * _n + depth
+		"e": return k * _n + (_n - 1 - depth)
+		"n": return depth * _n + k
+	return (_n - 1 - depth) * _n + k
+
+
 func _flatten_roads() -> void:
 	var weight := PackedFloat32Array()
 	weight.resize(_n * _n)
@@ -1102,6 +1191,7 @@ func _build_roads() -> void:
 		if not structure:
 			_place_street_props(pts, heights, hw, lift, rank, road_idx)
 	roads = {vertices = verts, uvs = uvs, uv2s = uv2s, colors = colors, indices = indices}
+	_collect_road_faces(verts, indices)
 	# Keep trees off the pavements (props above are placed before this).
 	var mask_cell := size / MASK_RES
 	for p: Dictionary in net.paved:

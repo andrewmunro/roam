@@ -12,6 +12,8 @@ extends Node3D
 
 var _spawn_pending := false
 var _stuck_check := 0.0
+var _spawn_heading := NAN  ## degrees clockwise from north, from a shared link
+var _url_timer := 0.0
 
 
 func _ready() -> void:
@@ -21,7 +23,38 @@ func _ready() -> void:
 	hud.road_teleport_requested.connect(func(target: Vector3) -> void:
 		if not _spawn_pending and not _place_on_road(target, car.global_transform.basis.z, 0.0, 400.0):
 			hud.set_status("No road there yet"))
-	teleport(start_lat, start_lon, start_label)
+	var shared := _location_from_url()
+	if not shared.is_empty():
+		_spawn_heading = shared.get("heading", NAN)
+		teleport(shared.lat, shared.lon, "%.5f, %.5f" % [shared.lat, shared.lon])
+	else:
+		teleport(start_lat, start_lon, start_label)
+
+
+## Web only: "#lat,lon[,heading]" in the page URL (a shared link) or empty.
+func _location_from_url() -> Dictionary:
+	if not OS.has_feature("web"):
+		return {}
+	var hash_text := str(JavaScriptBridge.eval("window.location.hash", true)).trim_prefix("#")
+	var parts := hash_text.uri_decode().replace(" ", "").split(",")
+	if parts.size() < 2 or not parts[0].is_valid_float() or not parts[1].is_valid_float():
+		return {}
+	var out := {lat = clampf(parts[0].to_float(), -85.0, 85.0), lon = wrapf(parts[1].to_float(), -180.0, 180.0)}
+	if parts.size() >= 3 and parts[2].is_valid_float():
+		out.heading = parts[2].to_float()
+	return out
+
+
+## Keeps the page URL pointing at the car, so it can be copied and shared.
+func _process(delta: float) -> void:
+	_url_timer -= delta
+	if _url_timer > 0.0 or _spawn_pending or not OS.has_feature("web"):
+		return
+	_url_timer = 2.0
+	var ll := Geo.local_to_latlon(car.global_position)
+	var f := car.global_transform.basis.z
+	var heading := fposmod(rad_to_deg(atan2(f.x, -f.z)), 360.0)
+	JavaScriptBridge.eval("history.replaceState(null, '', '#%.5f,%.5f,%d')" % [ll.x, ll.y, roundi(heading)], true)
 
 
 func teleport(lat: float, lon: float, label: String) -> void:
@@ -57,7 +90,12 @@ func _on_chunk_ready(_chunk: Chunk) -> void:
 	if _spawn_pending and streamer.chunk_at(car.global_position):
 		_spawn_pending = false
 		hud.set_status("")
-		_place_on_road(car.global_position, Vector3.BACK)
+		var facing := Vector3.BACK
+		if not is_nan(_spawn_heading):
+			var h := deg_to_rad(_spawn_heading)
+			facing = Vector3(sin(h), 0.0, -cos(h))  # local -z is north
+			_spawn_heading = NAN
+		_place_on_road(car.global_position, facing)
 
 
 ## Moves the car to the closest drivable road (bigger roads preferred by `rank_bonus`

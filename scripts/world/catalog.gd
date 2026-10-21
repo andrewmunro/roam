@@ -33,7 +33,10 @@ const ROLES := {
 ## give-way signs). They use vertex colours instead of the atlas.
 const PROCEDURAL := ["traffic_light_pole", "sign_give_way"]
 ## Roles that get box colliders, and how far away each role stays visible.
-const SOLID_ROLES := ["parked_car", "parked_car_intl", "lamp_road", "traffic_light_pole"]
+const SOLID_ROLES := ["parked_car", "parked_car_intl"]
+## Fall over when the car hits them (see Knockables).
+const KNOCKABLE_ROLES := ["lamp_road", "traffic_light", "traffic_light_pole", "sign_stop",
+	"sign_give_way", "street_furniture", "street_furniture_intl", "park_furniture"]
 const VISIBILITY := {"street_furniture": 250.0, "street_furniture_intl": 250.0,
 	"park_furniture": 300.0, "sign_stop": 300.0, "sign_give_way": 300.0, "parked_car": 450.0,
 	"parked_car_intl": 450.0, "traffic_light": 600.0, "traffic_light_pole": 450.0}

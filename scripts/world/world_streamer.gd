@@ -205,14 +205,7 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 			return
 		job.waiting -= 1
 		if job.waiting == 0:
-			var tiles := _elevation_tiles(t, 1 if full else 0)
-			var osm := osm_points.snapshot(_osm_tiles(t)) if full else {}
-			job.builder = ChunkBuilder.new(t, lod, job.mvt, elevation.snapshot(tiles), job.neighbours, osm)
-			job.mvt = PackedByteArray()
-			job.neighbours = {}
-			job.state = "build"
-			if _use_threads:
-				job.task = WorkerThreadPool.add_task(job.builder.run_all, false, "chunk %s" % t)
+			job.state = "ready"  # _run_jobs starts it once no neighbour is mid-build
 	elevation.ensure(_elevation_tiles(t, 1 if full else 0), priority, arrived)
 	if full:
 		# Signals and mini-roundabouts; don't hold the chunk up for long if Overpass is slow.
@@ -253,6 +246,39 @@ func _mvt_url(t: Vector2i) -> String:
 		.replace("{x}", str(posmod(t.x, n))).replace("{y}", str(clampi(t.y, 0, n - 1)))
 
 
+## Creates the builder for a job whose data has arrived. Full chunks pin their edges to
+## already-built full neighbours, so terrain (and its collision) matches at the seams.
+func _begin_build(t: Vector2i, job: Dictionary) -> void:
+	var full: bool = job.lod == ChunkBuilder.Lod.FULL
+	var tiles := _elevation_tiles(t, 1 if full else 0)
+	var osm := osm_points.snapshot(_osm_tiles(t)) if full else {}
+	job.builder = ChunkBuilder.new(t, job.lod, job.mvt, elevation.snapshot(tiles), job.neighbours, osm)
+	if full:
+		for side: String in NEIGHBOUR_SIDES:
+			var c: Chunk = _chunks.get(t + NEIGHBOUR_SIDES[side])
+			if c and c.lod == ChunkBuilder.Lod.FULL and not c.edge_heights(OPPOSITE[side]).is_empty():
+				job.builder.edge_pins[side] = c.edge_heights(OPPOSITE[side])
+	job.mvt = PackedByteArray()
+	job.neighbours = {}
+	job.state = "build"
+	if _use_threads:
+		job.task = WorkerThreadPool.add_task(job.builder.run_all, false, "chunk %s" % t)
+
+
+const NEIGHBOUR_SIDES := {"w": Vector2i(-1, 0), "e": Vector2i(1, 0), "n": Vector2i(0, -1), "s": Vector2i(0, 1)}
+const OPPOSITE := {"w": "e", "e": "w", "n": "s", "s": "n"}
+
+
+## True if an edge-adjacent full chunk is being built: building both at once would leave
+## neither pinned to the other.
+func _neighbour_building(t: Vector2i) -> bool:
+	for off: Vector2i in NEIGHBOUR_SIDES.values():
+		var j: Dictionary = _jobs.get(t + off, {})
+		if not j.is_empty() and j.lod == ChunkBuilder.Lod.FULL and (j.state == "build" or j.state == "finalize"):
+			return true
+	return false
+
+
 func _run_jobs() -> void:
 	var start := Time.get_ticks_usec()
 	# Nearest jobs first so the area under the player is ready soonest.
@@ -261,7 +287,11 @@ func _run_jobs() -> void:
 	for t: Vector2i in order:
 		var job: Dictionary = _jobs[t]
 		while Time.get_ticks_usec() - start < FRAME_BUDGET_USEC:
-			if job.state == "build":
+			if job.state == "ready":
+				if job.lod == ChunkBuilder.Lod.FULL and _neighbour_building(t):
+					break
+				_begin_build(t, job)
+			elif job.state == "build":
 				if job.task != -1:
 					if not WorkerThreadPool.is_task_completed(job.task):
 						break

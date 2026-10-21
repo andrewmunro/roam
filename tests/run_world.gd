@@ -21,6 +21,9 @@ var _look_tunnel := false
 var _map_click := Vector2.INF  # --map-click=dx,dy: simulated minimap click (pixels from centre)
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
 var _checked := false
+var _collision_check := false
+var _knock := 0  # --knock: 1 waiting, 2 driving at a lamp, 3 done
+var _knock_target := Vector3.ZERO
 var _rebase_test := false
 var _rebase_stage := 0
 var _rebase_latlon := Vector2.ZERO
@@ -38,6 +41,10 @@ func _ready() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--shots="):
 			_shots = a.substr(8)
+		elif a == "--knock":
+			_knock = 1
+		elif a == "--collision-check":
+			_collision_check = true
 		elif a == "--rebase-test":
 			_rebase_test = true
 		elif a == "--touch":
@@ -110,6 +117,25 @@ func _process(delta: float) -> void:
 		print("map click %s: moved %.0f m (%.0f m ahead, %.0f m right), heading %s" % [_map_click, Vector2(rel.x, rel.z).length(),
 			rel.dot(fwd), rel.dot(fwd.cross(Vector3.UP)), MinimapOverlay.heading_text(hud._heading())])
 		_map_click = Vector2.INF
+	if _knock == 1 and not car.freeze and _t > 5.0:
+		_start_knock(car)
+	elif _knock == 2:
+		Input.action_press("accelerate", 0.7)
+		if _t > 13.0:
+			_knock = 3
+			var debris := 0
+			for c in _main.get_node("World").get_children():
+				for n in c.get_children():
+					if n is RigidBody3D:
+						debris += 1
+						print("knock: debris %s at %s, upright %.2f, speed %.1f m/s" % [n.get_child(0).mesh.resource_name,
+							n.global_position.snapped(Vector3.ONE * 0.1), n.global_transform.basis.y.dot(Vector3.UP),
+							n.linear_velocity.length()])
+			print("knock: %d props knocked over, car speed %.0f km/h at %s (lamp was at %s)" % [debris,
+				car.speed_kmh(), car.global_position.snapped(Vector3.ONE * 0.1), _knock_target.snapped(Vector3.ONE * 0.1)])
+	if _collision_check and not car.freeze and _t > 6.0:
+		_collision_check = false
+		_check_collision()
 	if _rebase_test:
 		_run_rebase_test(car)
 	if not car.freeze and not _checked and _t > 3.0:
@@ -373,3 +399,95 @@ func _start_tunnel_drive(car: Car) -> void:
 	car.place(start, dir)
 	_tunnel_drive = 2
 	print("tunnel drive: start %s dir %s" % [start, dir])
+
+
+## Road surface vs terrain collision (how far roads float), and terrain height
+## mismatches along shared edges of neighbouring full chunks.
+func _check_collision() -> void:
+	var world: WorldStreamer = _main.get_node("World")
+	var chunks: Dictionary = world._chunks
+	var gaps := PackedFloat32Array()
+	for t: Vector2i in chunks:
+		var c: Chunk = chunks[t]
+		if c.lod != ChunkBuilder.Lod.FULL:
+			continue
+		var roads: MeshInstance3D = c.get_node_or_null("Roads")
+		if roads == null:
+			continue
+		var verts: PackedVector3Array = roads.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
+		for k in range(0, verts.size(), 11):
+			var v := verts[k]
+			gaps.append(v.y - c.terrain_height(Vector2(v.x, v.z)))
+	gaps.sort()
+	var n := gaps.size()
+	print("road above terrain: n=%d median %.2f p90 %.2f p99 %.2f max %.2f m" % [n, gaps[n / 2], gaps[n * 9 / 10],
+		gaps[n * 99 / 100], gaps[n - 1]])
+	var worst := 0.0
+	var where := ""
+	var bad := 0
+	var total := 0
+	for t: Vector2i in chunks:
+		var a: Chunk = chunks[t]
+		if a.lod != ChunkBuilder.Lod.FULL or a._heights.is_empty():
+			continue
+		for off: Vector2i in [Vector2i(1, 0), Vector2i(0, 1)]:
+			var b: Chunk = chunks.get(t + off)
+			if b == null or b.lod != ChunkBuilder.Lod.FULL or b._heights.is_empty():
+				continue
+			var n2 := a._grid_n
+			for k in n2:
+				var ha: float
+				var hb: float
+				if off.x == 1:
+					ha = a._heights[k * n2 + n2 - 1]
+					hb = b._heights[k * n2]
+				else:
+					ha = a._heights[(n2 - 1) * n2 + k]
+					hb = b._heights[k]
+				var d := absf(ha - hb)
+				total += 1
+				if d > 0.05:
+					bad += 1
+				if d > worst:
+					worst = d
+					where = "%s|%s k=%d (%.2f vs %.2f)" % [t, t + off, k, ha, hb]
+	print("seam mismatch: %d of %d edge vertices > 5 cm, worst %.2f m at %s" % [bad, total, worst, where])
+
+
+## Lines the car up 25 m behind the nearest street lamp and drives into it.
+func _start_knock(car: Car) -> void:
+	var best := INF
+	for c in _main.get_node("World").get_children():
+		for body in c.get_children():
+			if body is StaticBody3D and body.has_meta("knock") and body.get_meta("knock").role == "lamp_road":
+				for cs in body.get_children():
+					var p: Vector3 = cs.global_position
+					var d := p.distance_to(car.global_position)
+					if d < best:
+						best = d
+						_knock_target = p
+	if best == INF:
+		print("knock: no lamps loaded")
+		_knock = 3
+		return
+	# Approach along the nearest road, in line with the lamp (as a driver veering off would).
+	var dir := Vector3(1, 0, 0.3).normalized()
+	var road_d := INF
+	for c in _main.get_node("World").get_children():
+		if not c is Chunk:
+			continue
+		for road: Dictionary in c.road_spawn:
+			var pts: PackedVector3Array = road.pts
+			for k in range(1, pts.size() - 1):
+				var d: float = (pts[k] + c.position).distance_to(_knock_target)
+				if d < road_d:
+					road_d = d
+					dir = pts[k + 1] - pts[k - 1]
+	dir = Vector3(dir.x, 0, dir.z).normalized()
+	var start := _knock_target - dir * 25.0
+	var hit := car.get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+		start + Vector3.UP * 100, start - Vector3.UP * 100, 3, [car.get_rid()]))
+	start.y = (hit.position.y if not hit.is_empty() else _knock_target.y) + 0.8
+	car.place(start, dir)
+	print("knock: lamp at %s, car starts %s" % [_knock_target.snapped(Vector3.ONE * 0.1), start.snapped(Vector3.ONE * 0.1)])
+	_knock = 2
