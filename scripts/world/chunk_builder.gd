@@ -110,6 +110,10 @@ var _have_neighbours := false
 ## Overpass nodes (signals, mini-roundabouts, stop/give-way) as [mx, my, kind, ...].
 var _osm_points := PackedFloat64Array()
 var _osm_complete := false
+## Mapped street lamps and trees (chunk space), from the same Overpass data.
+var _osm_lamps := PackedVector2Array()
+var _osm_trees := PackedVector2Array()
+const MIN_MAPPED_LAMPS := 6  # fewer than this in a tile: lamps are probably unmapped, so guess
 var _elev: ElevationSource
 var _merc0: PackedFloat64Array  # tile NW corner, mercator
 var _scale: float
@@ -176,6 +180,18 @@ func _init(p_tile: Vector2i, p_lod: Lod, mvt: PackedByteArray, elev: ElevationSo
 	tile = p_tile
 	_osm_points = osm.get("points", PackedFloat64Array())
 	_osm_complete = osm.get("complete", false)
+	var pts: PackedFloat64Array = _osm_points
+	for i in range(0, pts.size() - 2, 3):
+		var kind := int(pts[i + 2])
+		if kind != RoadNetwork.Pt.LAMP and kind != RoadNetwork.Pt.TREE:
+			continue
+		var p := Vector2((pts[i] - _merc0[0]) * _scale, (_merc0[1] - pts[i + 1]) * _scale)
+		if p.x < 0.0 or p.y < 0.0 or p.x >= size or p.y >= size:
+			continue
+		if kind == RoadNetwork.Pt.LAMP:
+			_osm_lamps.append(p)
+		else:
+			_osm_trees.append(p)
 	osm_complete = _osm_complete
 	lod = p_lod
 	_mvt_bytes = mvt
@@ -1220,7 +1236,8 @@ func _build_roads() -> void:
 		if rank >= DRIVABLE_RANK and not road.tunnel:
 			road_spawn.append({pts = spawn_pts, rank = rank})
 		if rank >= 6 and not structure:
-			_place_lamps(pts, heights, hw, lift, _road_paved(road.cls, road.pts))
+			if _osm_lamps.size() < MIN_MAPPED_LAMPS:
+				_place_lamps(pts, heights, hw, lift, _road_paved(road.cls, road.pts))
 		if not structure:
 			_place_street_props(pts, heights, hw, lift, rank, road_idx)
 	roads = {vertices = verts, uvs = uvs, uv2s = uv2s, colors = colors, indices = indices}
@@ -1474,6 +1491,46 @@ func _add_tunnel_box(pts: PackedVector2Array, heights: PackedFloat32Array, i0: i
 	tunnel_boxes.append(box)
 	if surface_gap < 3.0:
 		portal_boxes.append(box)
+
+
+## Mapped trees and street lamps at their real positions. Lamps face the nearest road;
+## trees use the same species mix as scattered ones.
+func _place_mapped() -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = _seed ^ 0x5eed
+	var rules := _scatter_rules()
+	var trees := "tree_broadleaf"
+	for role: String in rules.get(Cls.PARK, [0, {}])[1]:
+		if role.begins_with("tree"):
+			trees = role
+			break
+	for p in _osm_trees:
+		var s := rng.randf_range(0.9, 1.3)
+		var basis := Basis(Vector3.UP, rng.randf() * TAU).scaled(Vector3(s, s, s))
+		_add_instance(trees, Transform3D(basis, Vector3(p.x, height_at(p) - 0.15, p.y)))
+	if _osm_lamps.size() < MIN_MAPPED_LAMPS:
+		return
+	for p in _osm_lamps:
+		var arm := _towards_nearest_road(p)
+		var basis := Basis(arm, Vector3.UP, arm.cross(Vector3.UP))
+		_add_instance("lamp_road", Transform3D(basis, Vector3(p.x, height_at(p) + RoadNetwork.KERB, p.y)))
+
+
+## Unit vector (x/z) from p towards the closest road centreline (any if none nearby).
+func _towards_nearest_road(p: Vector2) -> Vector3:
+	var best := 40.0
+	var dir := Vector2.RIGHT
+	for road in _road_lines:
+		if ROADS[road.cls][1] < DRIVABLE_RANK:
+			continue
+		var line: PackedVector2Array = road.pts
+		for k in range(1, line.size()):
+			var q := Geometry2D.get_closest_point_to_segment(p, line[k - 1], line[k])
+			var d := p.distance_to(q)
+			if d < best and d > 0.1:
+				best = d
+				dir = (q - p) / d
+	return Vector3(dir.x, 0, dir.y)
 
 
 ## Street lamps on alternating sides; the model's arm points along +x.
@@ -1818,6 +1875,7 @@ func _scatter_rules() -> Dictionary:
 
 
 func _build_scatter() -> void:
+	_place_mapped()
 	var rng := RandomNumberGenerator.new()
 	rng.seed = _seed
 	var rules := _scatter_rules()

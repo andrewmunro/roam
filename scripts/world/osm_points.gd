@@ -14,13 +14,15 @@ const ZOOM := 12
 ## Tried in turn; both send CORS headers.
 const ENDPOINTS := ["https://overpass-api.de/api/interpreter?data=",
 	"https://maps.mail.ru/osm/tools/overpass/api/interpreter?data="]
-const QUERY := "[out:csv(::lat,::lon,highway;false)][timeout:25];" \
-	+ "node[highway~\"^(traffic_signals|mini_roundabout|give_way|stop)$\"](%s);out;"
+const QUERY := "[out:csv(::lat,::lon,highway,natural;false)][timeout:25];(" \
+	+ "node[highway~\"^(traffic_signals|mini_roundabout|give_way|stop|street_lamp)$\"](%s);" \
+	+ "node[natural=tree](%s););out;"
 const KINDS := {
 	"traffic_signals": RoadNetwork.Pt.SIGNALS, "mini_roundabout": RoadNetwork.Pt.MINI,
 	"give_way": RoadNetwork.Pt.GIVE_WAY, "stop": RoadNetwork.Pt.STOP,
+	"street_lamp": RoadNetwork.Pt.LAMP,
 }
-const CACHE_DIR := "user://cache/osm"
+const CACHE_DIR := "user://cache/osm2"  # osm2: also trees and street lamps
 const RETRY_MSEC := 120000  # a failed tile is asked for again after this long
 const TIMEOUT := 30.0
 
@@ -172,18 +174,26 @@ static func _query(t: Vector2i) -> String:
 	var nw := Geo.merc_to_lonlat(m[0], m[1])
 	var se := Geo.merc_to_lonlat(m[0] + s, m[1] - s)
 	var bbox := "%.5f,%.5f,%.5f,%.5f" % [se[1], nw[0], nw[1], se[0]]
-	return (QUERY % bbox).uri_encode()
+	return (QUERY % [bbox, bbox]).uri_encode()
 
 
-## "lat<TAB>lon<TAB>highway" lines -> [mx, my, kind, ...]; other lines are skipped.
+## "lat<TAB>lon<TAB>highway<TAB>natural" lines -> [mx, my, kind, ...]; other lines are
+## skipped.
 static func parse_csv(text: String) -> PackedFloat64Array:
 	var out := PackedFloat64Array()
 	for line in text.split("\n", false):
-		var f := line.strip_edges().split("\t")
-		if f.size() < 3 or not KINDS.has(f[2]) or not f[0].is_valid_float():
+		var f := line.split("\t")
+		if f.size() < 3 or not f[0].is_valid_float():
+			continue
+		var kind := -1
+		if KINDS.has(f[2].strip_edges()):
+			kind = KINDS[f[2].strip_edges()]
+		elif f.size() >= 4 and f[3].strip_edges() == "tree":
+			kind = RoadNetwork.Pt.TREE
+		if kind == -1:
 			continue
 		var m := Geo.lonlat_to_merc(f[1].to_float(), f[0].to_float())
-		out.append_array([m[0], m[1], float(KINDS[f[2]])])
+		out.append_array([m[0], m[1], float(kind)])
 	return out
 
 

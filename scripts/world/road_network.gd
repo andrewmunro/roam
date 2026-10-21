@@ -26,7 +26,7 @@ const STYLE_PAINT := 64  ## UV2.y for solid paint (see road.gdshader)
 const GRID := 24.0  ## spatial hash cell for clearance queries
 
 enum Ctl { NONE, PRIORITY, SIGNALS, ALL_STOP, MINI }
-enum Pt { SIGNALS, MINI, GIVE_WAY, STOP }
+enum Pt { SIGNALS, MINI, GIVE_WAY, STOP, LAMP, TREE }  # append only: values are cached on disk
 
 # Inputs
 var size: float
