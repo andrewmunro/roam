@@ -15,6 +15,7 @@ var _report_every := 5.0
 var _topdown := 0.0
 var _look_around := false
 var _look_tunnel := false
+var _map_click := Vector2.INF  # --map-click=dx,dy: simulated minimap click (pixels from centre)
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
 var _checked := false
 var _rebase_test := false
@@ -47,6 +48,9 @@ func _ready() -> void:
 			_drive_after = a.substr(14).to_float()
 		elif a == "--tunnel-drive":
 			_tunnel_drive = 1
+		elif a.begins_with("--map-click="):
+			var v := a.substr(12).split(",")
+			_map_click = Vector2(v[0].to_float(), v[1].to_float())
 		elif a == "--look-tunnel":
 			_look_tunnel = true
 		elif a == "--look-around":
@@ -87,6 +91,16 @@ func _process(delta: float) -> void:
 		_start_tunnel_drive(car)
 	if _tunnel_drive == 2:
 		Input.action_press("accelerate", 0.6)
+	if _map_click != Vector2.INF and not car.freeze and _t > 5.0:
+		var hud: Node = _main.get_node("HUD")
+		var before := car.global_position
+		var fwd := car.global_transform.basis.z
+		hud._on_map_clicked(_map_click)
+		var after := car.global_position
+		var rel := after - before
+		print("map click %s: moved %.0f m (%.0f m ahead, %.0f m right), heading %s" % [_map_click, Vector2(rel.x, rel.z).length(),
+			rel.dot(fwd), rel.dot(fwd.cross(Vector3.UP)), MinimapOverlay.heading_text(hud._heading())])
+		_map_click = Vector2.INF
 	if _rebase_test:
 		_run_rebase_test(car)
 	if not car.freeze and not _checked and _t > 3.0:
