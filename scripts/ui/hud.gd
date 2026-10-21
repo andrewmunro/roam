@@ -1,11 +1,17 @@
 extends CanvasLayer
-## Speed/coords readout, minimap, location search and controls help. Built in code.
+## Speed/coords readout, minimap, location search, controls help and touch controls.
+## Built in code; switches to a compact layout on narrow (portrait) screens.
 
 signal teleport_requested(lat: float, lon: float, label: String)
+signal road_teleport_requested(global_pos: Vector3)  ## minimap click: nearest road to here
 
 const NOMINATIM := "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&q=%s"
 const MINIMAP_SIZE := 220
-const MINIMAP_SPAN := 700.0  # metres shown across
+const MINIMAP_SIZE_NARROW := 150
+const NARROW_WIDTH := 1000.0  # canvas units below which the compact layout is used
+const MINIMAP_SPAN := 700.0  # default metres shown across
+const MINIMAP_SPAN_MIN := 150.0
+const MINIMAP_SPAN_MAX := 5000.0  # roughly the loaded area
 
 @export var car: Car
 @export var streamer: WorldStreamer
@@ -16,25 +22,41 @@ var _area_label: Label
 var _settlement := ""
 var _describe_timer := 0.0
 var _info_label: Label
+var _info_box: VBoxContainer
 var _status_label: Label
+var _search_column: VBoxContainer
 var _search: LineEdit
 var _results: ItemList
 var _result_coords: Array[Vector2] = []
 var _minimap_cam: Camera3D
 var _minimap_panel: Control
+var _minimap_view: SubViewportContainer
+var _minimap_marker: Polygon2D
+var _minimap_overlay: MinimapOverlay
+var _minimap_span := MINIMAP_SPAN
+var _help: Label
+var _touch: TouchControls
 var _last_search_msec := -10000
 
 
 func _ready() -> void:
+	_touch = TouchControls.new()
+	_touch.name = "TouchControls"
+	add_child(_touch)
 	_build_info()
-	_build_search()
 	_build_minimap()
+	_build_search()  # after the minimap so search results draw (and click) over it
 	_build_help()
+	_touch.exclude = [_search_column, _minimap_panel]
+	_touch.active_changed.connect(func(_on: bool) -> void: _layout())
+	get_viewport().size_changed.connect(_layout)
+	_layout()
 
 
 func _build_info() -> void:
 	var box := VBoxContainer.new()
 	box.position = Vector2(16, 12)
+	_info_box = box
 	add_child(box)
 	_speed_label = _label(36)
 	_road_label = _label(20)
@@ -50,11 +72,7 @@ func _build_info() -> void:
 
 func _build_search() -> void:
 	var column := VBoxContainer.new()
-	column.anchor_left = 0.5
-	column.anchor_right = 0.5
-	column.offset_left = -210
-	column.offset_right = 210
-	column.offset_top = 12
+	_search_column = column
 	add_child(column)
 	var row := HBoxContainer.new()
 	column.add_child(row)
@@ -77,16 +95,13 @@ func _build_search() -> void:
 
 func _build_minimap() -> void:
 	var panel := PanelContainer.new()
-	panel.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
-	panel.position = Vector2(-MINIMAP_SIZE - 16, 12)
 	_minimap_panel = panel
 	add_child(panel)
 	var svc := SubViewportContainer.new()
-	svc.custom_minimum_size = Vector2(MINIMAP_SIZE, MINIMAP_SIZE)
 	svc.stretch = true
+	_minimap_view = svc
 	panel.add_child(svc)
 	var vp := SubViewport.new()
-	vp.size = Vector2i(MINIMAP_SIZE, MINIMAP_SIZE)
 	vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	svc.add_child(vp)
 	_minimap_cam = Camera3D.new()
@@ -107,13 +122,20 @@ func _build_minimap() -> void:
 	var marker := Polygon2D.new()
 	marker.polygon = PackedVector2Array([Vector2(0, -9), Vector2(6, 7), Vector2(0, 3), Vector2(-6, 7)])
 	marker.color = Color(1, 0.35, 0.2)
-	marker.position = Vector2(MINIMAP_SIZE, MINIMAP_SIZE) * 0.5
+	_minimap_marker = marker
 	svc.add_child(marker)
+	_minimap_overlay = MinimapOverlay.new()
+	_minimap_overlay.zoom_requested.connect(func(f: float) -> void:
+		_minimap_span = clampf(_minimap_span * f, MINIMAP_SPAN_MIN, MINIMAP_SPAN_MAX)
+		_minimap_cam.size = _minimap_span)
+	_minimap_overlay.map_clicked.connect(_on_map_clicked)
+	panel.add_child(_minimap_overlay)
 
 
 func _build_help() -> void:
 	var help := _label(13)
-	help.text = "W/S drive · A/D steer · Space handbrake · Shift boost · R reset · M map · right-drag look · wheel zoom"
+	_help = help
+	help.text = "W/S drive · A/D steer · Space handbrake · Shift boost · R reset · M map · click map to teleport · right-drag look · wheel zoom"
 	help.modulate = Color(1, 1, 1, 0.75)
 	help.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_LEFT)
 	help.position = Vector2(16, -30)
@@ -124,6 +146,53 @@ func _build_help() -> void:
 	credit.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT)
 	credit.position = Vector2(-380, -24)
 	add_child(credit)
+
+
+## Places the top widgets for the current screen shape. Portrait screens get a larger UI
+## scale (so text stays readable on phones), a full-width search bar and a smaller map.
+func _layout() -> void:
+	var win := Vector2(get_window().size)
+	if win.x <= 0.0 or win.y <= 0.0:
+		return
+	var base := Vector2(ProjectSettings.get_setting("display/window/size/viewport_width"),
+		ProjectSettings.get_setting("display/window/size/viewport_height"))
+	var factor := 1.0
+	if win.y > win.x:
+		# canvas_items stretch fits the base width here; scale up so the short side
+		# spans base.y units, as it does in landscape.
+		factor = maxf(1.0, base.x / base.y)
+	if not is_equal_approx(get_window().content_scale_factor, factor):
+		get_window().content_scale_factor = factor  # emits size_changed, which re-runs this
+		return
+	var view := get_viewport().get_visible_rect().size
+	var narrow := view.x < NARROW_WIDTH
+	var map_size := MINIMAP_SIZE_NARROW if narrow else MINIMAP_SIZE
+	_minimap_view.custom_minimum_size = Vector2(map_size, map_size)
+	_minimap_marker.position = Vector2(map_size, map_size) * 0.5
+	_minimap_panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	var top := 12.0
+	if narrow:
+		# Search bar across the top, info and map below it.
+		_search_column.anchor_left = 0.0
+		_search_column.anchor_right = 1.0
+		_search_column.offset_left = 16
+		_search_column.offset_right = -16
+		_search.custom_minimum_size.y = 40
+		top = 12.0 + 40.0 + 10.0
+	else:
+		_search_column.anchor_left = 0.5
+		_search_column.anchor_right = 0.5
+		_search_column.offset_left = -210
+		_search_column.offset_right = 210
+		_search.custom_minimum_size.y = 0
+	_search_column.offset_top = 12
+	_info_box.position = Vector2(16, top)
+	var panel_size := _minimap_panel.get_combined_minimum_size()
+	_minimap_panel.offset_left = -panel_size.x - 16
+	_minimap_panel.offset_right = -16
+	_minimap_panel.offset_top = top
+	_minimap_panel.offset_bottom = top + panel_size.y
+	_help.visible = not _touch.active and not narrow
 
 
 func _label(font_size: int) -> Label:
@@ -161,7 +230,9 @@ func _process(delta: float) -> void:
 			if not s.is_empty() and not parts.has(s):
 				parts.append(s)
 		_area_label.text = " · ".join(parts)
-	_speed_label.text = "%d km/h" % roundi(absf(car.speed_kmh()))
+	var heading := _heading()
+	_minimap_overlay.heading = heading
+	_speed_label.text = "%d km/h   %s" % [roundi(absf(car.speed_kmh())), MinimapOverlay.heading_text(heading)]
 	var ll := Geo.local_to_latlon(car.global_position)
 	_info_label.text = "%.5f, %.5f   alt %d m   %d fps" % [ll.x, ll.y, roundi(car.global_position.y),
 		Engine.get_frames_per_second()]
@@ -173,6 +244,23 @@ func _process(delta: float) -> void:
 			fwd = fwd.normalized()
 			var basis := Basis(fwd.cross(Vector3.UP), fwd, Vector3.UP)
 			_minimap_cam.global_transform = Transform3D(basis, xf.origin + Vector3.UP * 1500.0)
+
+
+## Car heading in radians, clockwise from north (local -z is north, +x east).
+func _heading() -> float:
+	var f := car.get_global_transform_interpolated().basis.z
+	return atan2(f.x, -f.z)
+
+
+## Minimap pixel offset (screen axes, from centre) -> world position. The map is
+## drawn with the car's heading up and `_minimap_span` metres across.
+func _on_map_clicked(offset: Vector2) -> void:
+	var xf := car.get_global_transform_interpolated()
+	var fwd := Vector3(xf.basis.z.x, 0.0, xf.basis.z.z).normalized()
+	var right := fwd.cross(Vector3.UP)
+	var metres_per_px := _minimap_span / _minimap_view.size.y
+	var target := xf.origin + (right * offset.x - fwd * offset.y) * metres_per_px
+	road_teleport_requested.emit(target)
 
 
 func _on_search(text: String) -> void:

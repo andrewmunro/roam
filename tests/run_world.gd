@@ -2,6 +2,8 @@ extends Node
 ## Loads the main scene, lets it stream, and reports progress. Optionally drives
 ## forward and saves screenshots (when not headless).
 ## Run: godot --path . res://tests/run_world.tscn [-- --shots=dir --drive]
+## --touch shows the touch controls; --touch-drive also drives with simulated touches
+## (gas pedal, then the steering stick pushed right).
 
 var _main: Node
 var _t := 0.0
@@ -16,6 +18,7 @@ var _aerial_tilt := 0.35
 var _target := Vector2.ZERO  # requested lat/lon
 var _look_around := false
 var _look_tunnel := false
+var _map_click := Vector2.INF  # --map-click=dx,dy: simulated minimap click (pixels from centre)
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
 var _checked := false
 var _rebase_test := false
@@ -24,6 +27,12 @@ var _rebase_latlon := Vector2.ZERO
 var _shot_idx := 0
 var _max_frame_ms := 0.0
 var _last := 0
+var _touch := false
+var _touch_drive := false
+var _touch_t0 := -1.0
+var _touch_stage := 0
+var _touch_start := Vector3.ZERO
+var _heading0 := Vector3.ZERO
 
 func _ready() -> void:
 	for a in OS.get_cmdline_user_args():
@@ -31,12 +40,20 @@ func _ready() -> void:
 			_shots = a.substr(8)
 		elif a == "--rebase-test":
 			_rebase_test = true
+		elif a == "--touch":
+			_touch = true
+		elif a == "--touch-drive":
+			_touch = true
+			_touch_drive = true
 		elif a == "--drive":
 			_drive = true
 		elif a.begins_with("--drive-after="):
 			_drive_after = a.substr(14).to_float()
 		elif a == "--tunnel-drive":
 			_tunnel_drive = 1
+		elif a.begins_with("--map-click="):
+			var v := a.substr(12).split(",")
+			_map_click = Vector2(v[0].to_float(), v[1].to_float())
 		elif a == "--look-tunnel":
 			_look_tunnel = true
 		elif a == "--look-around":
@@ -71,12 +88,28 @@ func _process(delta: float) -> void:
 	var car: Car = _main.get_node("Car")
 	if _drive and not car.freeze and _t > _drive_after:
 		Input.action_press("accelerate")
+	if _touch:
+		var tc: TouchControls = _main.get_node("HUD/TouchControls")
+		if not tc.active:
+			tc.set_active(true)
+		if _touch_drive and not car.freeze:
+			_run_touch_drive(car, tc)
 	if _look_tunnel and not car.freeze:
 		_aim_at_tunnel()
 	if _tunnel_drive == 1 and not car.freeze and _t > 4.0:
 		_start_tunnel_drive(car)
 	if _tunnel_drive == 2:
 		Input.action_press("accelerate", 0.6)
+	if _map_click != Vector2.INF and not car.freeze and _t > 5.0:
+		var hud: Node = _main.get_node("HUD")
+		var before := car.global_position
+		var fwd := car.global_transform.basis.z
+		hud._on_map_clicked(_map_click)
+		var after := car.global_position
+		var rel := after - before
+		print("map click %s: moved %.0f m (%.0f m ahead, %.0f m right), heading %s" % [_map_click, Vector2(rel.x, rel.z).length(),
+			rel.dot(fwd), rel.dot(fwd.cross(Vector3.UP)), MinimapOverlay.heading_text(hud._heading())])
+		_map_click = Vector2.INF
 	if _rebase_test:
 		_run_rebase_test(car)
 	if not car.freeze and not _checked and _t > 3.0:
@@ -143,6 +176,68 @@ func _process(delta: float) -> void:
 			_shot_idx += 1
 	if _t > float(OS.get_environment("RUN_SECONDS") if OS.has_environment("RUN_SECONDS") else "40"):
 		get_tree().quit()
+
+
+## Drives with simulated screen touches on the floating stick: a finger lands mid-screen
+## and pushes up (throttle), after 3 s also right (steer), at 6 s back to straight up,
+## at 8 s down (brake), then lifts at 10 s.
+func _run_touch_drive(car: Car, tc: TouchControls) -> void:
+	if _touch_t0 < 0.0:
+		_touch_t0 = _t
+		_touch_start = car.global_position
+	var dt := _t - _touch_t0
+	var r := tc.stick_radius()
+	var origin := get_viewport().get_visible_rect().size * Vector2(0.4, 0.65)
+	if _touch_stage == 0:
+		_screen_touch(0, origin, true)
+		_screen_drag(0, origin + Vector2(0, -r), Vector2(0, -r))
+		print("touch: stick at %s pushed up, start %s" % [origin, _touch_start.snapped(Vector3.ONE * 0.1)])
+		_touch_stage = 1
+	elif _touch_stage == 1 and dt > 3.0:
+		print("touch: after 3 s speed=%.0f km/h moved %.1f m accelerate=%.2f" % [car.speed_kmh(),
+			car.global_position.distance_to(_touch_start), Input.get_action_strength("accelerate")])
+		_screen_drag(0, origin + Vector2(r * 0.7, -r * 0.7), Vector2(r * 0.7, r * 0.3))
+		_touch_stage = 2
+		_touch_start = car.global_position
+		_heading0 = car.global_transform.basis.z
+	elif _touch_stage == 2 and dt > 3.2:
+		print("touch: steer_right=%.2f steer_left=%.2f accelerate=%.2f" % [Input.get_action_strength("steer_right"),
+			Input.get_action_strength("steer_left"), Input.get_action_strength("accelerate")])
+		_touch_stage = 3
+	elif _touch_stage == 3 and dt > 6.0:
+		var h := car.global_transform.basis.z
+		var turn := rad_to_deg(Vector2(_heading0.x, _heading0.z).angle_to(Vector2(h.x, h.z)))
+		print("touch: steering 3 s turned %.0f deg, speed=%.0f km/h" % [turn, car.speed_kmh()])
+		_screen_drag(0, origin + Vector2(0, -r), Vector2(-r * 0.7, -r * 0.3))
+		_touch_stage = 4
+	elif _touch_stage == 4 and dt > 8.0:
+		_screen_drag(0, origin + Vector2(0, r), Vector2(0, 2.0 * r))
+		print("touch: pulled down at %.0f km/h, brake=%.2f" % [car.speed_kmh(), Input.get_action_strength("brake")])
+		_touch_stage = 5
+	elif _touch_stage == 5 and dt > 10.0:
+		print("touch: after 2 s braking speed=%.0f km/h" % car.speed_kmh())
+		_screen_touch(0, origin + Vector2(0, r), false)
+		_touch_stage = 6
+	elif _touch_stage == 6 and dt > 10.5:
+		print("touch: released, steer=%.2f accelerate=%.2f brake=%.2f" % [Input.get_action_strength("steer_right"),
+			Input.get_action_strength("accelerate"), Input.get_action_strength("brake")])
+		_touch_stage = 7
+
+
+func _screen_touch(index: int, canvas_pos: Vector2, pressed: bool) -> void:
+	var ev := InputEventScreenTouch.new()
+	ev.index = index
+	ev.pressed = pressed
+	ev.position = get_viewport().get_final_transform() * canvas_pos
+	Input.parse_input_event(ev)
+
+
+func _screen_drag(index: int, canvas_pos: Vector2, rel: Vector2) -> void:
+	var ev := InputEventScreenDrag.new()
+	ev.index = index
+	ev.position = get_viewport().get_final_transform() * canvas_pos
+	ev.relative = get_viewport().get_final_transform().basis_xform(rel)
+	Input.parse_input_event(ev)
 
 
 ## Compares road ribbon heights with the terrain collision directly beneath them.

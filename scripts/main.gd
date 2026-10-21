@@ -18,6 +18,9 @@ func _ready() -> void:
 	car.streamer = streamer
 	streamer.chunk_ready.connect(_on_chunk_ready)
 	hud.teleport_requested.connect(teleport)
+	hud.road_teleport_requested.connect(func(target: Vector3) -> void:
+		if not _spawn_pending and not _place_on_road(target, car.global_transform.basis.z, 0.0, 400.0):
+			hud.set_status("No road there yet"))
 	teleport(start_lat, start_lon, start_label)
 
 
@@ -57,9 +60,11 @@ func _on_chunk_ready(_chunk: Chunk) -> void:
 		_place_on_road(car.global_position, Vector3.BACK)
 
 
-## Moves the car to the closest drivable road (bigger roads preferred), or onto the
-## terrain if there are no roads nearby.
-func _place_on_road(near: Vector3, fallback_dir: Vector3) -> void:
+## Moves the car to the closest drivable road (bigger roads preferred by `rank_bonus`
+## metres per rank), or onto the terrain if there are no roads nearby. With
+## `max_dist` set, only roads within that distance count and false is returned
+## (car untouched) if there are none.
+func _place_on_road(near: Vector3, fallback_dir: Vector3, rank_bonus := 15.0, max_dist := INF) -> bool:
 	var best_score := INF
 	var best_pos := Vector3.ZERO
 	var best_dir := fallback_dir
@@ -72,11 +77,16 @@ func _place_on_road(near: Vector3, fallback_dir: Vector3) -> void:
 				var pts: PackedVector3Array = road.pts
 				for k in range(1, pts.size() - 1):
 					var p := pts[k] + c.position
-					var score: float = Vector2(p.x - near.x, p.z - near.z).length() - road.rank * 15.0
+					var dist := Vector2(p.x - near.x, p.z - near.z).length()
+					if dist > max_dist:
+						continue
+					var score: float = dist - road.rank * rank_bonus
 					if score < best_score:
 						best_score = score
 						best_pos = p
 						best_dir = pts[k + 1] - pts[k - 1]
+	if best_score == INF and max_dist < INF:
+		return false
 	if best_score == INF:
 		var hit := get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
 			Vector3(near.x, 9000, near.z), Vector3(near.x, -1000, near.z)))
@@ -85,3 +95,4 @@ func _place_on_road(near: Vector3, fallback_dir: Vector3) -> void:
 	if best_dir.dot(fallback_dir) < 0.0 and fallback_dir != Vector3.BACK:
 		best_dir = -best_dir
 	car.place(best_pos + Vector3.UP * 0.6, best_dir)
+	return true
