@@ -753,21 +753,21 @@ func _quad(a: int, b: int, c: int, d: int, facing := Vector3.UP) -> void:
 
 
 ## Flat polygon (any winding), triangulated; heights per vertex.
-func _fill(poly: PackedVector2Array, hs: PackedFloat32Array, color: Color) -> void:
-	var tris := Geometry2D.triangulate_polygon(poly)
-	if tris.is_empty():
-		var hull := Geometry2D.convex_hull(poly)
-		var lookup := {}
-		for k in poly.size():
-			lookup[poly[k]] = hs[k]
-		poly = hull.slice(0, hull.size() - 1)
-		hs = PackedFloat32Array()
-		for p in poly:
-			hs.append(lookup.get(p, 0.0))
-		tris = Geometry2D.triangulate_polygon(poly)
+func _fill(poly: PackedVector2Array, hs: PackedFloat32Array, color: Color, centre: Vector2) -> void:
 	var base := verts.size()
 	for k in poly.size():
 		_vert(Vector3(poly[k].x, hs[k], poly[k].y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+	var tris := Geometry2D.triangulate_polygon(poly)
+	if tris.is_empty():
+		# Self-intersecting outline (crossing corner curves at awkward junctions): fan
+		# from the centre instead; overlaps don't show as it's all one colour.
+		var h := -INF
+		for v in hs:
+			h = maxf(h, v)
+		var mid := _vert(Vector3(centre.x, h, centre.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		for k in poly.size():
+			_tri(mid, base + k, base + (k + 1) % poly.size())
+		return
 	for t in range(0, tris.size(), 3):
 		_tri(base + tris[t], base + tris[t + 1], base + tris[t + 2])
 
@@ -859,8 +859,8 @@ func _style(e: Dictionary) -> int:
 		style |= 32
 	elif base_hw >= 6.0:
 		style |= 1 << 2
-	if e.mark >= 2:
-		style |= 16
+	if e.mark >= 2 and not e.pave:
+		style |= 16  # edge lines on open roads; in town the kerb is the edge
 	return style
 
 
@@ -1071,7 +1071,7 @@ func _emit_cluster(c: Dictionary) -> void:
 		kerb_h.append(mb.h)
 		if arms[i].pave and arms[j].pave and (n > 2 or not curve.is_empty()):
 			_fillet_kerb(kerb_pts, kerb_h)
-	_fill(poly, hs, color)
+	_fill(poly, hs, color, c.centre)
 	stats.junctions += 1
 	_emit_controls(c, arms)
 
@@ -1145,7 +1145,9 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 	if ctl == Ctl.SIGNALS:
 		stats.signals += 1
 		signal_spots.append(c.centre)
-	elif ctl == Ctl.MINI:
+	elif ctl == Ctl.PRIORITY and not north_america and major.x >= 0:
+		_centre_through(arms[major.x], arms[major.y])
+	if ctl == Ctl.MINI:
 		stats.mini += 1
 		_disc(c.centre, 1.6, height_at.call(c.centre) + _lift(major_rank), PAINT, true)
 	for i in arms.size():
@@ -1186,6 +1188,43 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 				if sign_here:
 					instances.append(["sign_give_way", _kerb_prop(arm, cut + 1.2)])
 				stats.give_way += 1
+
+
+## Carries the main road's centre line across the mouths of the side roads (UK and
+## most of Europe; American centre lines stop at the junction).
+func _centre_through(a: Dictionary, b: Dictionary) -> void:
+	if a.oneway != 0 or b.oneway != 0 or a.phantom or b.phantom or a.rank < 4 or b.rank < 4:
+		return
+	var ma := _mouth(a)
+	var mb := _mouth(b)
+	var pa: Vector2 = ma.p
+	var pb: Vector2 = mb.p
+	if pa.distance_to(pb) < 4.0 or (ma.t as Vector2).dot(mb.t) > -0.5:
+		return  # not a through road
+	var curve := _fillet(pa, ma.t, pb, mb.t, 12)
+	var pts := PackedVector2Array([pa])
+	if curve.is_empty():
+		for k in range(1, 12):
+			pts.append(pa.lerp(pb, k / 12.0))
+	else:
+		pts.append_array(curve)
+	pts.append(pb)
+	# Dashes 4 m on, 2 m off, centred on the gap like the ribbons' dashes.
+	var dist := PackedFloat32Array([0.0])
+	for k in range(1, pts.size()):
+		dist.append(dist[k - 1] + pts[k].distance_to(pts[k - 1]))
+	var total := dist[dist.size() - 1]
+	var n := maxf(roundf(total / 6.0), 1.0)
+	var period := total / n
+	var h := maxf(ma.h, mb.h)
+	for i in int(n):
+		var s0 := i * period + period * 0.17
+		var s1 := s0 + period * 0.66
+		var p0 := _point_at(pts, dist, s0)
+		var p1 := _point_at(pts, dist, s1)
+		var d := (p1 - p0).normalized()
+		var w := Vector2(-d.y, d.x) * 0.07
+		_paint([p0 - w, p1 - w, p1 + w, p0 + w], h)
 
 
 func _stop(arm: Dictionary, app: Vector2, room: float) -> void:
@@ -1279,6 +1318,17 @@ func _emit_ring(r: Dictionary) -> void:
 		var a := base + k * 2
 		var b := base + ((k + 1) % seg) * 2
 		_quad(a, a + 1, b + 1, b)
+	# Wide rings get a dashed line between their two lanes.
+	if r.hw * 2.0 >= 8.0:
+		var dashes := maxi(roundi(TAU * radius / 6.0), 8)
+		for k in dashes:
+			var a0 := (k + 0.2) * TAU / dashes
+			var a1 := (k + 0.7) * TAU / dashes
+			var d0 := Vector2.from_angle(a0)
+			var d1 := Vector2.from_angle(a1)
+			var h := ring_h[int(a0 / TAU * seg) % seg]
+			_paint([centre + d0 * (radius - 0.07), centre + d1 * (radius - 0.07),
+				centre + d1 * (radius + 0.07), centre + d0 * (radius + 0.07)], h)
 	# Entries and exits flare into the ring.
 	for arm: Dictionary in r.arms:
 		_ring_mouth(r, arm)
@@ -1354,7 +1404,7 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 			for p in curve:
 				poly.append(p)
 				hs.append(height_at.call(p) + lift)
-	_fill(poly, hs, arm.color)
+	_fill(poly, hs, arm.color, (m.p as Vector2).lerp(centre, 0.3))
 	var app := _approach(arm)
 	if app != Vector2.ZERO and not arm.phantom:
 		_across(arm, maxf(arm.s_exit + 0.3, 0.5), app.x, app.y, 0.25, 0.6, 0.3)

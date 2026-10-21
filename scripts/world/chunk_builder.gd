@@ -1007,8 +1007,10 @@ func _build_roads() -> void:
 	_rings = net.ring_zones
 	_no_park.resize(MASK_RES * MASK_RES)
 	_no_park.fill(0)
+	var cell := size / MASK_RES
 	for z: Dictionary in net.no_park:
-		Raster.stroke_polyline(_no_park, MASK_RES, MASK_RES, size / MASK_RES, z.pts, z.hw, 1)
+		# Half a cell wider: cells are coarse and sampled at their centres.
+		Raster.stroke_polyline(_no_park, MASK_RES, MASK_RES, cell, z.pts, z.hw + cell * 0.5, 1)
 	road_stats = net.stats
 	signal_spots = net.signal_spots
 	for road_idx in _road_lines.size():
@@ -1419,7 +1421,7 @@ func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, h
 			var side := 1.0 if rng.randf() < 0.5 else -1.0
 			var nrm := Vector2(-fwd.y, fwd.x) * side
 			var p: Vector2 = s[0] + nrm * (hw + 1.4)
-			if free_spot.call(p + nrm * 0.8) and not _on_roundabout(p):
+			if free_spot.call(p + nrm * 0.8) and not _on_roundabout(p) and not _near_junction(p):
 				var y: float = s[2] + lift + RoadNetwork.KERB  # on the pavement
 				_add_instance(RegionStyle.street_furniture_role(region), _facing(Vector3(p.x, y, p.y), -nrm))
 			d += rng.randf_range(15.0, 35.0)
