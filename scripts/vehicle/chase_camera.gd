@@ -1,5 +1,6 @@
 extends Camera3D
-## Smoothed third-person camera. Mouse wheel zooms, right-drag orbits (springs back).
+## Smoothed third-person camera. Mouse wheel zooms, right-drag (or a one-finger drag
+## on empty screen) orbits and springs back.
 
 @export var target: Node3D
 @export var distance := 9.0
@@ -8,6 +9,7 @@ extends Camera3D
 
 var _orbit := 0.0
 var _dragging := false
+var _orbit_touch := -1  # index of the finger orbiting the camera
 
 
 func _ready() -> void:
@@ -26,6 +28,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			MOUSE_BUTTON_RIGHT: _dragging = event.pressed
 	elif event is InputEventMouseMotion and _dragging:
 		_orbit -= event.relative.x * 0.008
+	# Touches reach here only if the touch controls and HUD didn't take them.
+	elif event is InputEventScreenTouch:
+		if event.pressed and _orbit_touch == -1:
+			_orbit_touch = event.index
+		elif not event.pressed and event.index == _orbit_touch:
+			_orbit_touch = -1
+	elif event is InputEventScreenDrag and event.index == _orbit_touch:
+		_orbit -= event.relative.x * 0.006
 
 
 func _process(delta: float) -> void:
@@ -37,7 +47,7 @@ func _process(delta: float) -> void:
 	if fwd.length_squared() < 1e-4:
 		fwd = Vector3.BACK
 	fwd = fwd.normalized().rotated(Vector3.UP, _orbit)
-	if not _dragging:
+	if not _dragging and _orbit_touch == -1:
 		_orbit = lerpf(_orbit, 0.0, 1.0 - exp(-delta * 1.5))
 	var tunnel: bool = target is Car and target.in_tunnel
 	var dist := minf(distance, 6.0) if tunnel else distance
