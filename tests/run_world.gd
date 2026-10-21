@@ -157,45 +157,50 @@ func _process(delta: float) -> void:
 		get_tree().quit()
 
 
-## Drives with simulated screen touches: holds the gas pedal, after 3 s pushes the
-## steering stick right, releases it at 6 s and the gas at 8 s.
+## Drives with simulated screen touches on the floating stick: a finger lands mid-screen
+## and pushes up (throttle), after 3 s also right (steer), at 6 s back to straight up,
+## at 8 s down (brake), then lifts at 10 s.
 func _run_touch_drive(car: Car, tc: TouchControls) -> void:
 	if _touch_t0 < 0.0:
 		_touch_t0 = _t
 		_touch_start = car.global_position
 	var dt := _t - _touch_t0
-	var gas := tc.button_rect("accelerate").get_center()
-	var stick := tc.stick_home()
-	var r := tc.button_rect("accelerate").size.x * 0.72  # roughly the stick radius
+	var r := tc.stick_radius()
+	var origin := get_viewport().get_visible_rect().size * Vector2(0.4, 0.65)
 	if _touch_stage == 0:
-		_screen_touch(0, gas, true)
-		print("touch: gas down at %s, start %s" % [gas, _touch_start.snapped(Vector3.ONE * 0.1)])
+		_screen_touch(0, origin, true)
+		_screen_drag(0, origin + Vector2(0, -r), Vector2(0, -r))
+		print("touch: stick at %s pushed up, start %s" % [origin, _touch_start.snapped(Vector3.ONE * 0.1)])
 		_touch_stage = 1
 	elif _touch_stage == 1 and dt > 3.0:
-		print("touch: after 3 s speed=%.0f km/h moved %.1f m" % [car.speed_kmh(), car.global_position.distance_to(_touch_start)])
-		_screen_touch(1, stick, true)
-		_screen_drag(1, stick + Vector2(r * 0.9, 0), Vector2(r * 0.9, 0))
+		print("touch: after 3 s speed=%.0f km/h moved %.1f m accelerate=%.2f" % [car.speed_kmh(),
+			car.global_position.distance_to(_touch_start), Input.get_action_strength("accelerate")])
+		_screen_drag(0, origin + Vector2(r * 0.7, -r * 0.7), Vector2(r * 0.7, r * 0.3))
 		_touch_stage = 2
 		_touch_start = car.global_position
 		_heading0 = car.global_transform.basis.z
-	elif _touch_stage == 2 and dt > 3.2 and dt < 3.4:
+	elif _touch_stage == 2 and dt > 3.2:
 		print("touch: steer_right=%.2f steer_left=%.2f accelerate=%.2f" % [Input.get_action_strength("steer_right"),
 			Input.get_action_strength("steer_left"), Input.get_action_strength("accelerate")])
 		_touch_stage = 3
 	elif _touch_stage == 3 and dt > 6.0:
 		var h := car.global_transform.basis.z
 		var turn := rad_to_deg(Vector2(_heading0.x, _heading0.z).angle_to(Vector2(h.x, h.z)))
-		print("touch: steering 3 s turned %.0f deg, speed=%.0f km/h, moved %.1f m" % [turn, car.speed_kmh(),
-			car.global_position.distance_to(_touch_start)])
-		_screen_touch(1, stick + Vector2(r * 0.9, 0), false)
+		print("touch: steering 3 s turned %.0f deg, speed=%.0f km/h" % [turn, car.speed_kmh()])
+		_screen_drag(0, origin + Vector2(0, -r), Vector2(-r * 0.7, -r * 0.3))
 		_touch_stage = 4
 	elif _touch_stage == 4 and dt > 8.0:
-		_screen_touch(0, gas, false)
+		_screen_drag(0, origin + Vector2(0, r), Vector2(0, 2.0 * r))
+		print("touch: pulled down at %.0f km/h, brake=%.2f" % [car.speed_kmh(), Input.get_action_strength("brake")])
 		_touch_stage = 5
-	elif _touch_stage == 5 and dt > 8.5:
-		print("touch: released, steer=%.2f accelerate=%.2f speed=%.0f km/h" % [Input.get_action_strength("steer_right"),
-			Input.get_action_strength("accelerate"), car.speed_kmh()])
+	elif _touch_stage == 5 and dt > 10.0:
+		print("touch: after 2 s braking speed=%.0f km/h" % car.speed_kmh())
+		_screen_touch(0, origin + Vector2(0, r), false)
 		_touch_stage = 6
+	elif _touch_stage == 6 and dt > 10.5:
+		print("touch: released, steer=%.2f accelerate=%.2f brake=%.2f" % [Input.get_action_strength("steer_right"),
+			Input.get_action_strength("accelerate"), Input.get_action_strength("brake")])
+		_touch_stage = 7
 
 
 func _screen_touch(index: int, canvas_pos: Vector2, pressed: bool) -> void:

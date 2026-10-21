@@ -1,7 +1,9 @@
 class_name TouchControls
 extends Control
-## On-screen driving controls for touch screens: a steering stick bottom-left, gas and
-## brake pedals bottom-right, and small handbrake/boost/reset buttons. They press the
+## On-screen driving controls for touch screens. The first finger that lands anywhere
+## (except on HUD widgets or the small buttons) becomes a floating joystick centred
+## under it, drawn only while held: X steers, up accelerates, down brakes and then
+## reverses. Small handbrake/boost/reset buttons sit in the corners. They press the
 ## regular input actions, so the car can't tell them from a keyboard or gamepad.
 ## Shown on touch devices (or on the first touch); hidden again by keyboard/gamepad use.
 
@@ -11,14 +13,12 @@ signal active_changed(active: bool)
 ## the same physical size on any screen density or stretch factor.
 const STICK_RADIUS := 62.0
 const KNOB_RADIUS := 27.0
-const PEDAL_SIZE := Vector2(86, 124)
-const BRAKE_SIZE := Vector2(86, 100)
 const SMALL_SIZE := Vector2(86, 40)
 const RESET_SIZE := Vector2(70, 36)
 const MARGIN := 16.0
 const GAP := 14.0
 const FONT_SIZE := 12.0
-const STICK_DEADZONE := 0.08
+const STICK_DEADZONE := 0.12
 
 const FILL := Color(0, 0, 0, 0.3)
 const FILL_PRESSED := Color(1, 1, 1, 0.32)
@@ -27,15 +27,16 @@ const TEXT_OUTLINE := Color(0, 0, 0, 0.8)
 
 ## Canvas units kept free along the bottom edge (for the map credit line).
 @export var bottom_reserve := 22.0
+## HUD widgets (search, minimap…) that keep their touches instead of starting the stick.
+var exclude: Array[Control] = []
 
 var active := false
 var _px := 1.0  # canvas units per CSS pixel
 var _margin := Vector4.ZERO  # safe-area margins: left, top, right, bottom
-var _stick_home := Vector2.ZERO
 var _stick_centre := Vector2.ZERO
 var _stick_touch := -1
-var _stick_x := 0.0
-## id -> {rect, label, action, pedal, touches: Array[int]}
+var _stick := Vector2.ZERO  # -1..1 on both axes, screen orientation (y down)
+## id -> {rect, label, action, touches: Array[int]}
 var _buttons := {}
 var _touches := {}  # touch index -> button id, or "stick"
 var _strength := {}  # action -> strength last sent
@@ -44,11 +45,8 @@ var _strength := {}  # action -> strength last sent
 func _ready() -> void:
 	set_anchors_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
-	for id: String in ["accelerate", "brake", "handbrake", "boost", "reset_car"]:
-		_buttons[id] = {rect = Rect2(), touches = [] as Array[int], action = id,
-			pedal = id == "accelerate" or id == "brake"}
-	_buttons.accelerate.label = "GAS"
-	_buttons.brake.label = "BRAKE"
+	for id: String in ["handbrake", "boost", "reset_car"]:
+		_buttons[id] = {rect = Rect2(), touches = [] as Array[int], action = id}
 	_buttons.handbrake.label = "HANDBRAKE"
 	_buttons.boost.label = "BOOST"
 	_buttons.reset_car.label = "RESET"
@@ -68,13 +66,13 @@ func set_active(on: bool) -> void:
 	queue_redraw()
 
 
-## Canvas-space rect of a control, by action name (used by tests).
+## Canvas-space rect of a button, by action name (used by tests).
 func button_rect(id: String) -> Rect2:
 	return _buttons[id].rect
 
 
-func stick_home() -> Vector2:
-	return _stick_home
+func stick_radius() -> float:
+	return STICK_RADIUS * _px
 
 
 func _layout() -> void:
@@ -97,22 +95,13 @@ func _layout() -> void:
 		_margin.z = maxf(_margin.z, (screen.x - safe.end.x) * k)
 		_margin.w = maxf(_margin.w, (screen.y - safe.end.y) * k)
 	var bottom := vp.y - _margin.w - bottom_reserve
-	var r := STICK_RADIUS * _px
-	_stick_home = Vector2(_margin.x + r, bottom - r)
-	if _stick_touch == -1:
-		_stick_centre = _stick_home
-	var gas := PEDAL_SIZE * _px
-	var brake := BRAKE_SIZE * _px
 	var small := SMALL_SIZE * _px
 	var gap := GAP * _px
-	var gas_pos := Vector2(vp.x - _margin.z - gas.x, bottom - gas.y)
-	var brake_pos := Vector2(gas_pos.x - gap - brake.x, bottom - brake.y)
-	_buttons.accelerate.rect = Rect2(gas_pos, gas)
-	_buttons.brake.rect = Rect2(brake_pos, brake)
-	_buttons.boost.rect = Rect2(Vector2(gas_pos.x, gas_pos.y - gap - small.y), small)
-	_buttons.handbrake.rect = Rect2(Vector2(brake_pos.x, gas_pos.y - gap - small.y), small)
+	var boost_pos := Vector2(vp.x - _margin.z - small.x, bottom - small.y)
+	_buttons.boost.rect = Rect2(boost_pos, small)
+	_buttons.handbrake.rect = Rect2(Vector2(boost_pos.x, boost_pos.y - gap - small.y), small)
 	var reset := RESET_SIZE * _px
-	_buttons.reset_car.rect = Rect2(Vector2(_margin.x, _stick_home.y - r - gap - reset.y), reset)
+	_buttons.reset_car.rect = Rect2(Vector2(_margin.x, bottom - reset.y), reset)
 	queue_redraw()
 
 
@@ -144,13 +133,13 @@ func _touch(event: InputEvent) -> void:
 	if event is InputEventScreenTouch and event.pressed:
 		var id := _hit(pos)
 		if id.is_empty():
-			return  # not ours: camera orbit or the HUD gets it
+			return  # not ours: the HUD or the camera orbit gets it
 		get_viewport().gui_release_focus()  # leave the search box so driving works
 		_touches[index] = id
 		if id == "stick":
 			_stick_touch = index
-			_stick_centre = _clamp_stick(pos)
-			_stick_x = 0.0
+			_stick_centre = pos
+			_stick = Vector2.ZERO
 		else:
 			_buttons[id].touches.append(index)
 			if id == "reset_car":
@@ -162,8 +151,7 @@ func _touch(event: InputEvent) -> void:
 		_touches.erase(index)
 		if id == "stick":
 			_stick_touch = -1
-			_stick_x = 0.0
-			_stick_centre = _stick_home
+			_stick = Vector2.ZERO
 		else:
 			_buttons[id].touches.erase(index)
 			if id == "reset_car":
@@ -171,54 +159,47 @@ func _touch(event: InputEvent) -> void:
 	else:
 		if not _touches.has(index):
 			return
-		var id: String = _touches[index]
-		if id == "stick":
-			var dx := (pos.x - _stick_centre.x) / (STICK_RADIUS * _px)
-			_stick_x = clampf(dx, -1.0, 1.0)
-		elif _buttons[id].pedal:
-			# Let a thumb slide between the pedals.
-			var other := "brake" if id == "accelerate" else "accelerate"
-			if _grown(_buttons[other].rect).has_point(pos):
-				_buttons[id].touches.erase(index)
-				_buttons[other].touches.append(index)
-				_touches[index] = other
+		if _touches[index] == "stick":
+			var r := STICK_RADIUS * _px
+			var d := pos - _stick_centre
+			# Dragging past the rim pulls the base along, so the stick never "runs out".
+			if d.length() > r:
+				_stick_centre = pos - d.normalized() * r
+				d = pos - _stick_centre
+			_stick = d / r
 	get_viewport().set_input_as_handled()
 	_apply()
 	queue_redraw()
 
 
-## Which control is under `pos`: a button id, "stick", or "" for none.
+## Which control is under `pos`: a button id, "stick", or "" for HUD widgets and when
+## the stick is already held (so a second finger can orbit the camera).
 func _hit(pos: Vector2) -> String:
 	for id: String in _buttons:
-		if _grown(_buttons[id].rect).has_point(pos):
+		if _buttons[id].rect.grow(8.0 * _px).has_point(pos):
 			return id
-	# The stick floats: a touch anywhere in the lower-left area grabs it.
-	var r := STICK_RADIUS * _px
-	var zone_top := minf(_stick_home.y - r * 1.6, get_viewport_rect().size.y * 0.45)
-	if pos.x < maxf(_stick_home.x + r * 1.8, get_viewport_rect().size.x * 0.4) and pos.y > zone_top \
-			and pos.x < _buttons.brake.rect.position.x - GAP * _px:
-		return "stick"
-	return ""
+	for c in exclude:
+		if c.is_visible_in_tree() and c.get_global_rect().has_point(pos):
+			return ""
+	return "stick" if _stick_touch == -1 else ""
 
 
-func _grown(rect: Rect2) -> Rect2:
-	return rect.grow(8.0 * _px)
-
-
-func _clamp_stick(pos: Vector2) -> Vector2:
-	var r := STICK_RADIUS * _px
-	var vp := get_viewport_rect().size
-	return Vector2(clampf(pos.x, _margin.x + r, vp.x - r), clampf(pos.y, r, vp.y - _margin.w - r))
+## Deadzone plus a gentle curve, per axis.
+static func _shape(v: float) -> float:
+	var mag := absf(v)
+	if mag <= STICK_DEADZONE:
+		return 0.0
+	return signf(v) * pow((mag - STICK_DEADZONE) / (1.0 - STICK_DEADZONE), 1.3)
 
 
 func _apply() -> void:
-	var steer := 0.0
-	var mag := absf(_stick_x)
-	if mag > STICK_DEADZONE:
-		steer = signf(_stick_x) * pow((mag - STICK_DEADZONE) / (1.0 - STICK_DEADZONE), 1.3)
+	var steer := _shape(clampf(_stick.x, -1.0, 1.0))
+	var pedal := _shape(clampf(-_stick.y, -1.0, 1.0))  # up is positive
 	_set_action("steer_left", maxf(-steer, 0.0))
 	_set_action("steer_right", maxf(steer, 0.0))
-	for id: String in ["accelerate", "brake", "handbrake", "boost"]:
+	_set_action("accelerate", maxf(pedal, 0.0))
+	_set_action("brake", maxf(-pedal, 0.0))
+	for id: String in ["handbrake", "boost"]:
 		_set_action(id, 1.0 if not _buttons[id].touches.is_empty() else 0.0)
 
 
@@ -244,8 +225,7 @@ func _send_action(action: String, pressed: bool) -> void:
 func _release_all() -> void:
 	_touches.clear()
 	_stick_touch = -1
-	_stick_x = 0.0
-	_stick_centre = _stick_home
+	_stick = Vector2.ZERO
 	for id: String in _buttons:
 		_buttons[id].touches.clear()
 	_apply()
@@ -255,20 +235,19 @@ func _draw() -> void:
 	var font := get_theme_default_font()
 	var fs := int(FONT_SIZE * _px)
 	var line := maxf(1.5 * _px, 1.0)
-	# Steering stick: a round base with left/right chevrons and a knob that slides sideways.
-	var r := STICK_RADIUS * _px
-	var held := _stick_touch != -1
-	draw_circle(_stick_centre, r, FILL)
-	draw_arc(_stick_centre, r, 0.0, TAU, 48, EDGE, line, true)
-	for side in [-1.0, 1.0]:
-		var tip := _stick_centre + Vector2(side * r * 0.82, 0)
-		var back := tip - Vector2(side * r * 0.16, 0)
-		draw_polyline(PackedVector2Array([back + Vector2(0, -r * 0.16), tip, back + Vector2(0, r * 0.16)]),
-			EDGE, line * 1.4, true)
-	var knob := _stick_centre + Vector2(_stick_x * r, 0)
-	draw_circle(knob, KNOB_RADIUS * _px, FILL_PRESSED if held else Color(1, 1, 1, 0.22))
-	draw_arc(knob, KNOB_RADIUS * _px, 0.0, TAU, 32, Color(1, 1, 1, 0.75), line, true)
-	# Buttons and pedals.
+	if _stick_touch != -1:
+		# Joystick: base ring with throttle/brake/steer chevrons and the knob under the finger.
+		var r := STICK_RADIUS * _px
+		draw_circle(_stick_centre, r, FILL)
+		draw_arc(_stick_centre, r, 0.0, TAU, 48, EDGE, line, true)
+		for dir: Vector2 in [Vector2.LEFT, Vector2.RIGHT, Vector2.UP, Vector2.DOWN]:
+			var tip := _stick_centre + dir * r * 0.82
+			var back := tip - dir * r * 0.16
+			var side := Vector2(-dir.y, dir.x) * r * 0.16
+			draw_polyline(PackedVector2Array([back + side, tip, back - side]), EDGE, line * 1.4, true)
+		var knob := _stick_centre + _stick.limit_length(1.0) * r
+		draw_circle(knob, KNOB_RADIUS * _px, FILL_PRESSED)
+		draw_arc(knob, KNOB_RADIUS * _px, 0.0, TAU, 32, Color(1, 1, 1, 0.75), line, true)
 	var box := StyleBoxFlat.new()
 	box.set_corner_radius_all(int(12 * _px))
 	box.set_border_width_all(int(maxf(1.5 * _px, 1.0)))
@@ -276,20 +255,9 @@ func _draw() -> void:
 	box.anti_aliasing = true
 	for id: String in _buttons:
 		var b: Dictionary = _buttons[id]
-		var rect: Rect2 = b.rect
-		var pressed: bool = not b.touches.is_empty()
-		box.bg_color = FILL_PRESSED if pressed else FILL
-		draw_style_box(box, rect)
-		var text_y := rect.get_center().y
-		if b.pedal:
-			# Chevron pointing up (gas) or down (brake/reverse) above the label.
-			var c := rect.get_center() - Vector2(0, rect.size.y * 0.12)
-			var w := rect.size.x * 0.2
-			var dir := -1.0 if id == "accelerate" else 1.0
-			draw_polyline(PackedVector2Array([c + Vector2(-w, -dir * w * 0.5), c + Vector2(0, dir * w * 0.5),
-				c + Vector2(w, -dir * w * 0.5)]), Color(1, 1, 1, 0.85), line * 2.0, true)
-			text_y = rect.get_center().y + rect.size.y * 0.2
-		_draw_text(font, fs, b.label, Vector2(rect.get_center().x, text_y))
+		box.bg_color = FILL_PRESSED if not b.touches.is_empty() else FILL
+		draw_style_box(box, b.rect)
+		_draw_text(font, fs, b.label, b.rect.get_center())
 
 
 func _draw_text(font: Font, fs: int, text: String, centre: Vector2) -> void:

@@ -47,6 +47,7 @@ func _ready() -> void:
 	_build_minimap()
 	_build_search()  # after the minimap so search results draw (and click) over it
 	_build_help()
+	_touch.exclude = [_search_column, _minimap_panel]
 	_touch.active_changed.connect(func(_on: bool) -> void: _layout())
 	get_viewport().size_changed.connect(_layout)
 	_layout()
