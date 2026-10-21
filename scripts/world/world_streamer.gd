@@ -12,10 +12,13 @@ const FAR_RADIUS := 2
 const UNLOAD_RADIUS := 3
 const REBASE_DISTANCE := 2000.0
 const FRAME_BUDGET_USEC := 4000
+## Longest a full chunk waits for Overpass junction data before guessing instead.
+const OSM_WAIT := 5.0
 
 @export var target: Node3D
 
 var elevation := ElevationSource.new()
+var osm_points := OsmPoints.new()
 var _tile_url := ""
 var _chunks := {}  # Vector2i -> Chunk (shown)
 var _jobs := {}  # Vector2i -> {lod, state, builder, task, chunk, generation}
@@ -29,6 +32,8 @@ func _ready() -> void:
 	if OS.has_environment("ROAM_NO_THREADS"):
 		_use_threads = false
 	Geo.origin_shifted.connect(_on_origin_shifted)
+	osm_points.attach(self)
+	osm_points.tile_loaded.connect(_on_osm_tile)
 	Fetch.request(TILEJSON_URL, _on_tilejson, -1.0, false)
 
 
@@ -47,6 +52,7 @@ func _on_tilejson(ok: bool, body: PackedByteArray) -> void:
 func reset() -> void:
 	_generation += 1
 	Fetch.cancel_queued()
+	osm_points.cancel_queued()
 	for c: Chunk in _chunks.values():
 		c.queue_free()
 	_chunks.clear()
@@ -191,7 +197,7 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 	var gen := _generation
 	var full := lod == ChunkBuilder.Lod.FULL
 	var job := {lod = lod, state = "fetch", builder = null, task = -1, chunk = null,
-		mvt = PackedByteArray(), neighbours = {}, waiting = 10 if full else 1}
+		mvt = PackedByteArray(), neighbours = {}, waiting = 11 if full else 1}
 	_jobs[t] = job
 	var priority := float(_ring_dist(t)) + (0.0 if lod == ChunkBuilder.Lod.FULL else 0.5)
 	var arrived := func() -> void:
@@ -200,7 +206,8 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 		job.waiting -= 1
 		if job.waiting == 0:
 			var tiles := _elevation_tiles(t, 1 if full else 0)
-			job.builder = ChunkBuilder.new(t, lod, job.mvt, elevation.snapshot(tiles), job.neighbours)
+			var osm := osm_points.snapshot(_osm_tiles(t)) if full else {}
+			job.builder = ChunkBuilder.new(t, lod, job.mvt, elevation.snapshot(tiles), job.neighbours, osm)
 			job.mvt = PackedByteArray()
 			job.neighbours = {}
 			job.state = "build"
@@ -208,6 +215,14 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 				job.task = WorkerThreadPool.add_task(job.builder.run_all, false, "chunk %s" % t)
 	elevation.ensure(_elevation_tiles(t, 1 if full else 0), priority, arrived)
 	if full:
+		# Signals and mini-roundabouts; don't hold the chunk up for long if Overpass is slow.
+		var osm_done := [false]
+		var osm_arrived := func() -> void:
+			if not osm_done[0]:
+				osm_done[0] = true
+				arrived.call()
+		osm_points.ensure(_osm_tiles(t), osm_arrived)
+		get_tree().create_timer(OSM_WAIT).timeout.connect(osm_arrived)
 		Fetch.request(_mvt_url(t), func(ok: bool, body: PackedByteArray) -> void:
 			if ok:
 				job.mvt = body
@@ -222,6 +237,14 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 					if ok:
 						job.neighbours[offset] = body
 					arrived.call(), priority + 0.3)
+
+
+## Overpass tiles covering a chunk and the margin RoadNetwork looks into.
+func _osm_tiles(t: Vector2i) -> Array[Vector2i]:
+	var m := Geo.tile_origin_merc(t, Geo.CHUNK_ZOOM)
+	var s := Geo.tile_size_merc(Geo.CHUNK_ZOOM)
+	var pad := RoadNetwork.MARGIN / Geo.scale
+	return OsmPoints.tiles_for_rect(m[0] - pad, m[1] - s - pad, m[0] + s + pad, m[1] + pad)
 
 
 func _mvt_url(t: Vector2i) -> String:
@@ -272,6 +295,14 @@ func _complete(t: Vector2i, job: Dictionary) -> void:
 	chunk.visible = true
 	_chunks[t] = chunk
 	chunk_ready.emit(chunk)
+
+
+## Overpass data arrived late: rebuild full chunks that had to guess their junctions.
+func _on_osm_tile(_osm_tile: Vector2i) -> void:
+	for t: Vector2i in _chunks:
+		var c: Chunk = _chunks[t]
+		if c.lod == ChunkBuilder.Lod.FULL and not c.osm_complete and not _jobs.has(t) 				and osm_points.has_all(_osm_tiles(t)):
+			_start_job(t, ChunkBuilder.Lod.FULL)
 
 
 func _on_origin_shifted(offset: Vector3) -> void:
