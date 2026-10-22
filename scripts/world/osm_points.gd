@@ -1,7 +1,8 @@
 class_name OsmPoints
 extends RefCounted
-## Junction details the vector tiles leave out: traffic signals, mini-roundabouts and
-## stop / give-way nodes, from the Overpass API (no key needed, and it sends CORS
+## Details the vector tiles leave out: traffic signals, mini-roundabouts and stop /
+## give-way nodes, trees, street lamps, and buildings with pointed or domed roofs
+## (pyramids, domes, spires: the tiles only carry heights, so they'd be boxes), from the Overpass API (no key needed, and it sends CORS
 ## headers so the web build can use it). One small CSV query per z12 tile (5-10 km
 ## across), kept on disk for good. Overpass is a shared and often overloaded service,
 ## so queries go one at a time on their own connection (never holding up map tiles),
@@ -14,15 +15,25 @@ const ZOOM := 12
 ## Tried in turn; both send CORS headers.
 const ENDPOINTS := ["https://overpass-api.de/api/interpreter?data=",
 	"https://maps.mail.ru/osm/tools/overpass/api/interpreter?data="]
-const QUERY := "[out:csv(::lat,::lon,highway,natural;false)][timeout:25];(" \
-	+ "node[highway~\"^(traffic_signals|mini_roundabout|give_way|stop|street_lamp)$\"](%s);" \
-	+ "node[natural=tree](%s););out;"
+## One exact-value clause per tag (index lookups; regexes scan every value of the key).
+static var QUERY := "[out:csv(::lat,::lon,highway,natural,\"roof:shape\",\"roof:height\";false)][timeout:25];(" \
+	+ "".join(["traffic_signals", "mini_roundabout", "give_way", "stop", "street_lamp"].map(
+		func(v: String) -> String: return "node[highway=%s]({bbox});" % v)) \
+	+ "node[natural=tree]({bbox});" \
+	+ "".join(["pyramidal", "dome", "onion", "cone"].map(
+		func(v: String) -> String: return "wr[\"roof:shape\"=%s]({bbox});" % v)) \
+	+ ");out center;"
 const KINDS := {
 	"traffic_signals": RoadNetwork.Pt.SIGNALS, "mini_roundabout": RoadNetwork.Pt.MINI,
 	"give_way": RoadNetwork.Pt.GIVE_WAY, "stop": RoadNetwork.Pt.STOP,
 	"street_lamp": RoadNetwork.Pt.LAMP,
 }
-const CACHE_DIR := "user://cache/osm2"  # osm2: also trees and street lamps
+const ROOFS := {
+	"pyramidal": RoadNetwork.Pt.ROOF_PYRAMIDAL, "cone": RoadNetwork.Pt.ROOF_CONE,
+	"dome": RoadNetwork.Pt.ROOF_DOME, "onion": RoadNetwork.Pt.ROOF_DOME,
+}
+const CACHE_DIR := "user://cache/osm3"  # osm2: also trees and street lamps; osm3: roofs
+const OLD_CACHE_DIR := "user://cache/osm2"
 const RETRY_MSEC := 120000  # a failed tile is asked for again after this long
 const TIMEOUT := 30.0
 
@@ -75,9 +86,18 @@ func ensure(tiles: Array[Vector2i], done: Callable) -> void:
 		if FileAccess.file_exists(_cache_path(t)):
 			_tiles[t] = FileAccess.get_file_as_bytes(_cache_path(t)).to_float64_array()
 			continue
+		if FileAccess.file_exists(_cache_path(t, OLD_CACHE_DIR)):
+			# Cached before roofs were asked for: use it now, fetch the full set behind it.
+			_tiles[t] = FileAccess.get_file_as_bytes(_cache_path(t, OLD_CACHE_DIR)).to_float64_array()
+			if not _waiting.has(t):
+				_waiting[t] = []
+				_queue.push_front(t)
+			continue
 		missing.append(t)
 	if missing.is_empty() or _http == null:
 		done.call()
+		if _http != null:
+			_pump()  # any upgrades queued above
 		return
 	var remaining := [missing.size()]
 	var on_one := func() -> void:
@@ -174,31 +194,40 @@ static func _query(t: Vector2i) -> String:
 	var nw := Geo.merc_to_lonlat(m[0], m[1])
 	var se := Geo.merc_to_lonlat(m[0] + s, m[1] - s)
 	var bbox := "%.5f,%.5f,%.5f,%.5f" % [se[1], nw[0], nw[1], se[0]]
-	return (QUERY % [bbox, bbox]).uri_encode()
+	return QUERY.replace("{bbox}", bbox).uri_encode()
 
 
-## "lat<TAB>lon<TAB>highway<TAB>natural" lines -> [mx, my, kind, ...]; other lines are
-## skipped.
+## "lat<TAB>lon<TAB>highway<TAB>natural<TAB>roof:shape<TAB>roof:height" lines ->
+## [mx, my, kind, ...]; other lines are skipped. A roof's kind carries its height in
+## metres as thousandths (see roof_height; 0 if not tagged).
 static func parse_csv(text: String) -> PackedFloat64Array:
 	var out := PackedFloat64Array()
 	for line in text.split("\n", false):
 		var f := line.split("\t")
 		if f.size() < 3 or not f[0].is_valid_float():
 			continue
-		var kind := -1
+		var kind := -1.0
 		if KINDS.has(f[2].strip_edges()):
 			kind = KINDS[f[2].strip_edges()]
 		elif f.size() >= 4 and f[3].strip_edges() == "tree":
 			kind = RoadNetwork.Pt.TREE
-		if kind == -1:
+		elif f.size() >= 5 and ROOFS.has(f[4].strip_edges()):
+			var h := f[5].strip_edges().trim_suffix("m").strip_edges() if f.size() >= 6 else ""
+			kind = ROOFS[f[4].strip_edges()] + (clampf(h.to_float(), 0.0, 999.0) / 1000.0 if h.is_valid_float() else 0.0)
+		if kind < 0.0:
 			continue
 		var m := Geo.lonlat_to_merc(f[1].to_float(), f[0].to_float())
-		out.append_array([m[0], m[1], float(kind)])
+		out.append_array([m[0], m[1], kind])
 	return out
 
 
-static func _cache_path(t: Vector2i) -> String:
-	return CACHE_DIR.path_join("%d_%d_%d.bin" % [ZOOM, t.x, t.y])
+## Tagged roof height in metres of a roof point's kind value (0 if not tagged).
+static func roof_height(kind: float) -> float:
+	return (kind - floorf(kind)) * 1000.0
+
+
+static func _cache_path(t: Vector2i, dir := CACHE_DIR) -> String:
+	return dir.path_join("%d_%d_%d.bin" % [ZOOM, t.x, t.y])
 
 
 static func _write_cache(t: Vector2i, points: PackedFloat64Array) -> void:

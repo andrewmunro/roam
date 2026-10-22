@@ -1,10 +1,11 @@
 class_name RoadNetwork
 extends RefCounted
-## Road graph for one chunk, built from the tile's at-grade roads plus the nearby parts
-## of the neighbouring tiles' roads. Roads become ribbons that stop short of each
-## junction; every junction gets one merged surface with rounded corners, kerbs,
-## markings and the signs or lights that control it, and small circular loops become
-## roundabouts. Pure data, so it runs on the chunk builder's worker thread.
+## Road graph for one chunk, built from the tile's roads (streets, bridges and tunnels)
+## plus the nearby parts of the neighbouring tiles' roads. Roads become ribbons that stop
+## short of each junction; every junction gets one merged surface with rounded corners,
+## kerbs, markings and the signs or lights that control it, and small circular loops
+## become roundabouts. Every surface takes its height from RoadLevels, so pieces meet
+## without steps. Pure data, so it runs on the chunk builder's worker thread.
 ##
 ## Every chunk sees the same graph around its edges, so junctions on a seam come out
 ## identically in both chunks. Geometry is emitted only by the chunk that owns it: edges
@@ -16,6 +17,7 @@ const MARGIN := 150.0  ## how far into the neighbouring tiles the graph reaches
 const DASH := 12.0  ## centre line period; each edge fits a whole number of them
 const KERB := 0.12
 const SURFACE_REACH := 2.0
+const SKIRT := 1.2  ## an unkerbed road edge slopes down into the ground over this much
 const PAVEMENT := 2.0
 const PAINT := Color(0.88, 0.88, 0.84)
 const YELLOW := Color(0.86, 0.68, 0.16)
@@ -27,7 +29,7 @@ const STYLE_PAINT := 64  ## UV2.y for solid paint (see road.gdshader)
 const GRID := 24.0  ## spatial hash cell for clearance queries
 
 enum Ctl { NONE, PRIORITY, SIGNALS, ALL_STOP, MINI }
-enum Pt { SIGNALS, MINI, GIVE_WAY, STOP, LAMP, TREE }  # append only: values are cached on disk
+enum Pt { SIGNALS, MINI, GIVE_WAY, STOP, LAMP, TREE, ROOF_PYRAMIDAL, ROOF_DOME, ROOF_CONE }  # append only: values are cached on disk
 
 # Inputs
 var size: float
@@ -36,6 +38,7 @@ var left_hand := false
 var north_america := false
 var uk := false
 var height_at: Callable  ## (Vector2) -> float, final terrain height
+var levels: RoadLevels  ## road surface heights (terrain-hugging streets when null)
 ## The same terrain as a grid (row-major, terrain_n squared vertices terrain_cell apart),
 ## for surface_at; height_at is used when it is left empty.
 var terrain := PackedFloat32Array()
@@ -59,6 +62,9 @@ var ring_zones: Array[Vector3] = []  ## roundabouts: (centre x, centre z, outer 
 var no_park: Array[Dictionary] = []
 var stats := {junctions = 0, roundabouts = 0, signals = 0, mini = 0, give_way = 0, stops = 0, blocks = 0}
 var signal_spots: Array[Vector2] = []  ## centres of signalised junctions (for tests)
+## Own edges that need structures (decks, tunnel tubes, cutting walls), whole (junction
+## surfaces included): {pts, hs (centre line surface), hw, rank, kind, portal: [start, end]}.
+var drawn: Array[Dictionary] = []
 
 var _lines: Array[Dictionary] = []
 var _node_pos := PackedVector2Array()
@@ -77,29 +83,15 @@ var mask_mode := false
 ## the settings menu (read by ChunkBuilder on its worker thread; set before building).
 static var use_mask := OS.has_environment("ROAM_ROAD_MASK")
 var road_mask: Image  ## set by build() in mask_mode (see UrbanBlocks.road_mask)
-var _cuttings: Array[Dictionary] = []  # {pts, hw} of roads down in open cuttings
-var _cut_grid := {}  # Vector2i -> Array of _cuttings indices
 var _pt_grid := {}  # Vector2i -> Array of point indices
 
 
-## Adds a road down in an open cutting (drawn elsewhere): no pavement hangs over it.
-func add_cutting(pts: PackedVector2Array, hw: float) -> void:
-	var i := _cuttings.size()
-	_cuttings.append({pts = pts, hw = hw})
-	for k in pts.size() - 1:
-		for c in _cells(pts[k], pts[k + 1], hw + PAVEMENT):
-			if _cut_grid.has(c):
-				if _cut_grid[c].back() != i:
-					_cut_grid[c].append(i)
-			else:
-				_cut_grid[c] = [i]
-
-
 ## Adds a road polyline. `oneway` follows OSM: 1 along the line, -1 against it.
-## Phantom lines (bridges, tunnels) shape junctions but are drawn elsewhere.
-## `lanes_hw` is the half width of the travel lanes alone (without parking).
+## `kind` is a RoadLevels.Kind: bridges and tunnels are drawn like streets but get no
+## kerbs, blocks or junction controls. `lanes_hw` is the half width of the travel lanes
+## alone (without parking).
 func add_line(pts: PackedVector2Array, cls: String, hw: float, lanes_hw: float, rank: int,
-		color: Color, marking: int, oneway: int, own: bool, pave: bool, phantom := false) -> void:
+		color: Color, marking: int, oneway: int, own: bool, pave: bool, kind := 0) -> void:
 	var p := PackedVector2Array()
 	for q in pts:
 		if p.is_empty() or q.distance_squared_to(p[p.size() - 1]) > 0.0025:
@@ -109,7 +101,8 @@ func add_line(pts: PackedVector2Array, cls: String, hw: float, lanes_hw: float, 
 	if oneway < 0:
 		p.reverse()
 	_lines.append({pts = p, cls = cls, hw = hw, lanes_hw = lanes_hw, rank = rank, color = color, mark = marking,
-		oneway = oneway != 0, own = own, pave = pave, phantom = phantom})
+		oneway = oneway != 0, own = own, pave = pave and kind == RoadLevels.Kind.GRADE, kind = kind,
+		structure = kind != RoadLevels.Kind.GRADE})
 
 
 func build() -> void:
@@ -123,6 +116,10 @@ func build() -> void:
 	_build_clusters()
 	tm.append(Time.get_ticks_usec())
 	_build_grids()
+	for e in _edges:
+		e.sunk = levels != null and _sunk(e)
+		if e.sunk:
+			e.pave = false  # down in a cutting: walls, not pavements
 	tm.append(Time.get_ticks_usec())
 	for r in _rings:
 		_ring_cuts(r)
@@ -139,12 +136,13 @@ func build() -> void:
 			_emit_cluster(c)
 	tm.append(Time.get_ticks_usec())
 	for e in _edges:
-		if e.own and not e.phantom and e.ring < 0:
+		if e.own and e.ring < 0:
 			_emit_edge(e)
+			_note_drawn(e)
 	if mask_mode:
 		var service: Array[Dictionary] = []
 		for e in _edges:
-			if not e.phantom and e.rank < 4:
+			if not e.structure and e.rank < 4:
 				service.append({pts = e.pts, hw = e.hw})
 		road_mask = _blocks.road_mask(service)
 	tm.append(Time.get_ticks_usec())
@@ -172,23 +170,58 @@ static func lift(rank: int) -> float:
 	return 0.12 + rank * 0.025
 
 
-## The road surface height at p, shared by every at-grade piece (carriageways, junction
-## and ring surfaces, kerbs, paint, props) and the ends of bridges and tunnels: anything
-## of a rank built at the same point gets the same height, so pieces meet without steps.
-## It depends on p and rank alone and clears the terrain within SURFACE_REACH of p.
-func surface_at(p: Vector2, rank: int) -> float:
+## The road surface height at p, shared by every piece of road (carriageways, junction
+## and ring surfaces, kerbs, paint, props): anything built at the same point of the same
+## kinds of road (`mask`, RoadLevels bits) gets the same height, so pieces meet without
+## steps. It comes from RoadLevels; where the terrain pokes up through a road that is
+## (nearly) at grade, the road is lifted over it. Deeper roads lie in cuttings, whose
+## terrain is cut away.
+func surface_at(p: Vector2, rank: int, mask := RoadLevels.GRADE_BIT, hint := NAN) -> float:
+	var t := _terrain_top(p)
+	var h := levels.surface(p, mask, RoadLevels.REACH, hint) if levels != null else NAN
+	if is_nan(h):
+		return t + _lift(rank)
+	if mask & RoadLevels.TUNNEL_BIT == 0:
+		# Terrain poking through (its coarse grid can't follow two roads close by at
+		# different heights): ride over it, unless the road is meant to be down in a
+		# cutting or dip, where the terrain is cut away instead.
+		var d := t - h
+		if d > 0.6 and levels.depth(p, 1.0) < 0.3:
+			h = t
+		elif d > 0.0:
+			h += d * (1.0 - smoothstep(0.6, 1.5, d))
+	return h + _lift(rank)
+
+
+## The level of the road whose centre line passes through p (no lift; NAN without
+## RoadLevels): the hint that keeps a piece's surface_at on its own road.
+func _level(p: Vector2, mask: int) -> float:
+	return levels.surface(p, mask) if levels != null else NAN
+
+
+## Highest terrain within SURFACE_REACH of p.
+func _terrain_top(p: Vector2) -> float:
 	if terrain_n == 0:  # no grid given (tests): sample through height_at
 		var g: float = height_at.call(p)
 		for d in [Vector2(SURFACE_REACH, 0), Vector2(-SURFACE_REACH, 0), Vector2(0, SURFACE_REACH),
 				Vector2(0, -SURFACE_REACH)]:
 			g = maxf(g, height_at.call(p + d))
-		return g + _lift(rank)
+		return g
 	var h := _terrain(p.x, p.y)
 	h = maxf(h, _terrain(p.x + SURFACE_REACH, p.y))
 	h = maxf(h, _terrain(p.x - SURFACE_REACH, p.y))
 	h = maxf(h, _terrain(p.x, p.y + SURFACE_REACH))
 	h = maxf(h, _terrain(p.x, p.y - SURFACE_REACH))
-	return h + _lift(rank)
+	return h
+
+
+## True if part of an edge lies down in a cutting.
+func _sunk(e: Dictionary) -> bool:
+	var pts: PackedVector2Array = e.pts
+	for k in pts.size():
+		if levels.depth(pts[k]) > 0.5:
+			return true
+	return false
 
 
 ## height_at, read straight off the terrain grid (it is called a lot).
@@ -380,7 +413,7 @@ func _add_edge(pts: PackedVector2Array, l: Dictionary, a: int, b: int) -> void:
 	var id := _edges.size()
 	_edges.append({a = a, b = b, pts = pts, dist = dist, len = length, hw = l.hw, lanes_hw = l.lanes_hw, rank = l.rank,
 		cls = l.cls, color = l.color, mark = l.mark, oneway = l.oneway, own = l.own, pave = l.pave,
-		phantom = l.phantom, c0 = 0.0, c1 = 0.0, ring = -1, internal = false, id = id})
+		kind = l.kind, structure = l.structure, c0 = 0.0, c1 = 0.0, ring = -1, internal = false, id = id})
 	_node_ends[a].append(id * 2)
 	_node_ends[b].append(id * 2 + 1)
 
@@ -428,7 +461,7 @@ func _find_rings() -> void:
 	var out := {}  # node -> oneway edges leaving it
 	for i in _edges.size():
 		var e: Dictionary = _edges[i]
-		if e.phantom or e.rank < 3:
+		if e.structure or e.rank < 3:
 			continue
 		if e.a == e.b:
 			_try_ring([i])  # closed loop, one way or not
@@ -439,7 +472,7 @@ func _find_rings() -> void:
 				out[e.a] = [i]
 	for i in _edges.size():
 		var e0: Dictionary = _edges[i]
-		if not e0.oneway or e0.ring >= 0 or e0.phantom or e0.a == e0.b or not out.has(e0.a) or e0.len > 150.0:
+		if not e0.oneway or e0.ring >= 0 or e0.structure or e0.a == e0.b or not out.has(e0.a) or e0.len > 150.0:
 			continue
 		if e0.len > 25.0 and (e0.pts as PackedVector2Array).size() < 3:
 			continue  # long and straight: not part of a roundabout
@@ -545,7 +578,7 @@ func _build_clusters() -> void:
 		parent[i] = i
 	for i in _edges.size():
 		var e: Dictionary = _edges[i]
-		if e.a == e.b or not _junction[e.a] or not _junction[e.b] or e.phantom:
+		if e.a == e.b or not _junction[e.a] or not _junction[e.b] or e.structure:
 			continue
 		# Merge when the two junction surfaces would overlap: each reaches about a
 		# carriageway width plus a corner radius from its node.
@@ -582,7 +615,6 @@ func _add_cluster(nodes: Array) -> void:
 		centre += _node_pos[n]
 	centre /= nodes.size()
 	var arms: Array[Dictionary] = []
-	var all_phantom := true
 	for n: int in nodes:
 		for end: int in _node_ends[n]:
 			var e: Dictionary = _edges[end >> 1]
@@ -590,8 +622,7 @@ func _add_cluster(nodes: Array) -> void:
 				continue
 			var arm := _walk_arm(n, end)
 			arms.append(arm)
-			all_phantom = all_phantom and arm.phantom
-	if arms.size() < 2 or all_phantom:
+	if arms.size() < 2:
 		return
 	for n: int in nodes:
 		for end: int in _node_ends[n]:
@@ -636,7 +667,8 @@ func _walk_arm(node: int, end: int) -> Dictionary:
 	if first.oneway:
 		oneway = 1 if end & 1 == 0 else -1
 	return {node = node, origin = _node_pos[node], path = path, len = total, far_junction = far_junction,
-		hw = first.hw, rank = first.rank, phantom = first.phantom, pave = first.pave, oneway = oneway,
+		hw = first.hw, rank = first.rank, kind = first.kind, structure = first.structure, pave = first.pave,
+		oneway = oneway,
 		color = first.color, dir = _arm_dir(first, end & 1), cut = 0.0, angle = 0.0}
 
 
@@ -758,7 +790,7 @@ func _ring_cuts(r: Dictionary) -> void:
 func _build_grids() -> void:
 	for i in _edges.size():
 		var e: Dictionary = _edges[i]
-		if e.phantom:
+		if e.structure:
 			continue
 		var pts: PackedVector2Array = e.pts
 		for k in pts.size() - 1:
@@ -793,16 +825,9 @@ func _on_other_road(p: Vector2, skip: int) -> bool:
 	return false
 
 
-## True if p is over an open cutting (its carriageway out to the walls).
+## True if p is over a road down in a cutting (its carriageway out to the walls).
 func _over_cutting(p: Vector2) -> bool:
-	for i: int in _cut_grid.get(Vector2i(floori(p.x / GRID), floori(p.y / GRID)), []):
-		var cut: Dictionary = _cuttings[i]
-		var pts: PackedVector2Array = cut.pts
-		var lim: float = cut.hw + 1.0
-		for k in pts.size() - 1:
-			if Geometry2D.get_closest_point_to_segment(p, pts[k], pts[k + 1]).distance_squared_to(p) < lim * lim:
-				return true
-	return false
+	return levels != null and levels.depth(p, 1.0) > 0.5
 
 
 ## Overpass points of a kind within `radius` of p.
@@ -864,10 +889,10 @@ func _fill(poly: PackedVector2Array, hs: PackedFloat32Array, color: Color, centr
 
 
 ## Paint quad (corners in order), lying on the road surface.
-func _paint(corners: Array[Vector2], rank: int, color := PAINT) -> void:
+func _paint(corners: Array[Vector2], rank: int, color := PAINT, mask := RoadLevels.GRADE_BIT, hint := NAN) -> void:
 	var base := verts.size()
 	for c in corners:
-		_vert(Vector3(c.x, surface_at(c, rank) + 0.02, c.y), Vector2.ZERO, Vector2(0.0, STYLE_PAINT), color)
+		_vert(Vector3(c.x, surface_at(c, rank, mask, hint) + 0.02, c.y), Vector2.ZERO, Vector2(0.0, STYLE_PAINT), color)
 	_quad(base, base + 1, base + 2, base + 3)
 
 
@@ -880,13 +905,16 @@ func _across(arm: Dictionary, s: float, x0: float, x1: float, width: float, dash
 	var t: Vector2 = f[1]
 	var n := Vector2(-t.y, t.x)
 	var half := t * width * 0.5
+	var hint := _level(p, 1 << arm.kind)
 	if dash <= 0.0:
-		_paint([p + n * x0 - half, p + n * x1 - half, p + n * x1 + half, p + n * x0 + half], arm.rank, color)
+		_paint([p + n * x0 - half, p + n * x1 - half, p + n * x1 + half, p + n * x0 + half], arm.rank, color,
+			1 << arm.kind, hint)
 		return
 	var x := x0
 	while x < x1 - 0.05:
 		var xe := minf(x + dash, x1)
-		_paint([p + n * x - half, p + n * xe - half, p + n * xe + half, p + n * x + half], arm.rank, color)
+		_paint([p + n * x - half, p + n * xe - half, p + n * xe + half, p + n * x + half], arm.rank, color,
+			1 << arm.kind, hint)
 		x = xe + gap
 
 
@@ -911,7 +939,8 @@ func _kerb_prop(arm: Dictionary, s: float, out := 0.6) -> Transform3D:
 	var n := Vector2(-t.y, t.x)
 	var side := 1.0 if left_hand else -1.0  # inbound drivers' near side
 	var q: Vector2 = p + n * side * (arm.hw + out)
-	var y: float = surface_at(p + n * side * arm.hw, arm.rank) + KERB if arm.pave else height_at.call(q)
+	var y: float = surface_at(p + n * side * arm.hw, arm.rank, 1 << arm.kind, _level(p, 1 << arm.kind)) + KERB \
+		if arm.pave else height_at.call(q)
 	var z := Vector3(t.x, 0.0, t.y)
 	return Transform3D(Basis(Vector3.UP.cross(z), Vector3.UP, z), Vector3(q.x, y, q.y))
 
@@ -997,6 +1026,8 @@ func _emit_edge(e: Dictionary) -> void:
 	var uv2 := Vector2(hw, style)
 	var color: Color = e.color
 	var base := verts.size()
+	# With the road mask the terrain surfaces streets, but not decks, tunnels or cuttings.
+	var meshed: bool = not mask_mode or e.structure or e.sunk
 	var left := PackedVector2Array()
 	var right := PackedVector2Array()
 	var hl := PackedFloat32Array()
@@ -1006,9 +1037,10 @@ func _emit_edge(e: Dictionary) -> void:
 		var n := Vector2(-tans[k].y, tans[k].x)
 		left.append(p + n * hw)
 		right.append(p - n * hw)
-		hl.append(surface_at(left[k], e.rank))
-		hr.append(surface_at(right[k], e.rank))
-		if mask_mode:
+		var hint := _level(p, 1 << e.kind)
+		hl.append(surface_at(left[k], e.rank, 1 << e.kind, hint))
+		hr.append(surface_at(right[k], e.rank, 1 << e.kind, hint))
+		if not meshed:
 			continue  # the terrain is the road surface (see road_mask)
 		var v := (ss[k] - c0) * scale
 		_vert(Vector3(left[k].x, hl[k], left[k].y), Vector2(0, v), uv2, color)
@@ -1025,6 +1057,40 @@ func _emit_edge(e: Dictionary) -> void:
 			nr.append((right[k] - left[k]).normalized())
 		_kerb(left, hl, nl, eid)
 		_kerb(right, hr, nr, eid)
+	elif meshed and not e.structure and not e.sunk:
+		var nl := PackedVector2Array()
+		var nr := PackedVector2Array()
+		for k in ss.size():
+			nl.append((left[k] - right[k]).normalized())
+			nr.append((right[k] - left[k]).normalized())
+		_skirt(left, hl, nl, color)
+		_skirt(right, hr, nr, color)
+
+
+## Records an own edge for the chunk builder's structures: bridges, tunnels, and
+## streets that dip into a cutting.
+func _note_drawn(e: Dictionary) -> void:
+	if levels == null or not (e.structure or e.sunk):
+		return
+	var pts := PackedVector2Array()
+	var src: PackedVector2Array = e.pts
+	for k in src.size() - 1:
+		var steps := maxi(1, ceili(src[k].distance_to(src[k + 1]) / 3.0))
+		for st in steps:
+			pts.append(src[k].lerp(src[k + 1], float(st) / steps))
+	pts.append(src[src.size() - 1])
+	var hs := PackedFloat32Array()
+	for p in pts:
+		hs.append(surface_at(p, e.rank, 1 << e.kind))
+	# A tunnel's portal is an end where it meets a road out in the open.
+	var portal := [false, false]
+	if e.kind == RoadLevels.Kind.TUNNEL:
+		for side in 2:
+			var node: int = e.a if side == 0 else e.b
+			for end: int in _node_ends[node]:
+				if _edges[end >> 1].kind != RoadLevels.Kind.TUNNEL:
+					portal[side] = true
+	drawn.append({pts = pts, hs = hs, hw = e.hw, rank = e.rank, kind = e.kind, portal = portal})
 
 
 static func _point_at(pts: PackedVector2Array, dist: PackedFloat32Array, d: float) -> Vector2:
@@ -1118,7 +1184,7 @@ func _kerb_run(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVecto
 func _build_blocks() -> void:
 	var roads: Array[Dictionary] = []
 	for e in _edges:
-		if not e.phantom and e.rank >= 4:
+		if not e.structure and e.rank >= 4:
 			roads.append({pts = e.pts, hw = e.hw, rank = e.rank, pave = e.pave, color = e.color})
 	var in_ring := func(p: Vector2) -> bool:
 		for z: Vector3 in ring_zones:
@@ -1126,7 +1192,7 @@ func _build_blocks() -> void:
 				return true
 		return false
 	_blocks = UrbanBlocks.new()
-	_blocks.build(size, roads, _cuttings, in_ring)
+	_blocks.build(size, roads, [], in_ring)
 	for poly in _blocks.blocks:
 		if _owned(UrbanBlocks._centroid(poly)):
 			_block_kerb(poly)
@@ -1157,7 +1223,7 @@ func _block_kerb(poly: PackedVector2Array) -> void:
 		var rank := 4 if road == UrbanBlocks.FREE else road & 31
 		paved.append(road != UrbanBlocks.FREE and road & UrbanBlocks.UNPAVED == 0)
 		ranks.append(rank)
-		hs.append(surface_at(pts[k], rank))
+		hs.append(surface_at(pts[k], rank, RoadLevels.GRADE_BIT, _terrain_top(pts[k])))
 	if not mask_mode:
 		_apron(pts, hs, out, ranks, paved)
 	# Start at an unpaved point so no run wraps past the end; all paved: close the ring.
@@ -1202,7 +1268,8 @@ func _apron(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2A
 		var color: Color = _blocks.colors.get(ranks[k], Color(0.47, 0.47, 0.48))
 		var q := pts[k] - out[k] * APRON
 		_vert(Vector3(pts[k].x, hs[k] - 0.04, pts[k].y), Vector2(0.5, 0.0), Vector2.ZERO, color)
-		_vert(Vector3(q.x, surface_at(q, ranks[k]) - 0.04, q.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		_vert(Vector3(q.x, surface_at(q, ranks[k], RoadLevels.GRADE_BIT, hs[k]) - 0.04, q.y), Vector2(0.5, 0.0),
+			Vector2.ZERO, color)
 	for k in n:
 		var a := base + k * 2
 		var b := base + ((k + 1) % n) * 2
@@ -1219,7 +1286,9 @@ func _mouth(arm: Dictionary) -> Dictionary:
 	var hw: float = arm.hw
 	var l := p + n * hw
 	var r := p - n * hw
-	return {p = p, t = t, l = l, r = r, hl = surface_at(l, arm.rank), hr = surface_at(r, arm.rank)}
+	var hint := _level(p, 1 << arm.kind)
+	return {p = p, t = t, l = l, r = r, hint = hint, hl = surface_at(l, arm.rank, 1 << arm.kind, hint),
+		hr = surface_at(r, arm.rank, 1 << arm.kind, hint)}
 
 
 ## Quadratic curve from a to b whose tangents run back along ta / tb (outward arm
@@ -1246,8 +1315,10 @@ func _emit_cluster(c: Dictionary) -> void:
 	var mouths: Array[Dictionary] = []
 	var top_rank := 0
 	var color := Color()
+	var mask := 0
 	for arm in arms:
 		mouths.append(_mouth(arm))
+		mask |= 1 << arm.kind
 		if arm.rank > top_rank:
 			top_rank = arm.rank
 			color = arm.color
@@ -1263,7 +1334,7 @@ func _emit_cluster(c: Dictionary) -> void:
 		var kerb_pts := PackedVector2Array([ma.l])
 		var kerb_h := PackedFloat32Array([ma.hl])
 		for p in curve:
-			var h := surface_at(p, maxi(arms[i].rank, arms[j].rank))
+			var h := surface_at(p, maxi(arms[i].rank, arms[j].rank), mask, _between(ma.hint, mb.hint))
 			poly.append(p)
 			hs.append(h)
 			kerb_pts.append(p)
@@ -1272,10 +1343,38 @@ func _emit_cluster(c: Dictionary) -> void:
 		kerb_h.append(mb.hr)
 		if arms[i].pave and arms[j].pave and (n > 2 or not curve.is_empty()):
 			_fillet_kerb(kerb_pts, kerb_h)
-	if not mask_mode:
+		elif mask == RoadLevels.GRADE_BIT and not mask_mode and kerb_pts.size() >= 2:
+			var out := PackedVector2Array()
+			for k in kerb_pts.size():
+				var tan := kerb_pts[mini(k + 1, kerb_pts.size() - 1)] - kerb_pts[maxi(k - 1, 0)]
+				out.append(Vector2(tan.y, -tan.x).normalized())
+			_skirt(kerb_pts, kerb_h, out, color)
+	if not mask_mode or mask != RoadLevels.GRADE_BIT:
 		_fill(poly, hs, color, c.centre)
 	stats.junctions += 1
 	_emit_controls(c, arms)
+
+
+## A strip from an unkerbed road edge (`pts` at heights `hs`) out and down into the
+## ground, so the edge never floats over terrain that falls away or leaves a gap.
+func _skirt(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Array, color: Color) -> void:
+	var base := verts.size()
+	for k in pts.size():
+		var q := pts[k] + out[k] * SKIRT
+		var ground: float = _terrain(q.x, q.y) if terrain_n > 0 else height_at.call(q)
+		_vert(Vector3(pts[k].x, hs[k] - 0.02, pts[k].y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		_vert(Vector3(q.x, minf(ground - 0.25, hs[k] - 0.3), q.y), Vector2(0.5, 0.0), Vector2.ZERO,
+			color.lerp(VERGE, 0.6))
+	for k in pts.size() - 1:
+		var a := base + k * 2
+		_quad(a, a + 2, a + 3, a + 1)
+
+
+## The mean of two level hints, either of which may be missing (NAN).
+static func _between(a: float, b: float) -> float:
+	if is_nan(a):
+		return b
+	return a if is_nan(b) else (a + b) * 0.5
 
 
 func _fillet_kerb(pts: PackedVector2Array, hs: PackedFloat32Array) -> void:
@@ -1299,7 +1398,7 @@ func _control(c: Dictionary, arms: Array[Dictionary]) -> int:
 	var min_rank := 99
 	var radius := 0.0
 	for arm in arms:
-		if arm.phantom:
+		if arm.structure:
 			continue
 		live += 1
 		max_rank = maxi(max_rank, arm.rank)
@@ -1356,11 +1455,11 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 		_centre_through(arms[major.x], arms[major.y])
 	if ctl == Ctl.MINI:
 		stats.mini += 1
-		_disc(c.centre, 1.6, surface_at(c.centre, major_rank), PAINT, true)
+		_disc(c.centre, 1.6, surface_at(c.centre, major_rank, RoadLevels.GRADE_BIT, _terrain_top(c.centre)), PAINT, true)
 	for i in arms.size():
 		var arm := arms[i]
 		var app := _approach(arm)
-		if arm.phantom or app == Vector2.ZERO:
+		if arm.structure or app == Vector2.ZERO:
 			continue
 		if arm.far_junction and arm.len < 30.0:
 			continue  # a short link to the next junction: controlled at that end
@@ -1402,7 +1501,7 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 ## Carries the main road's centre line across the mouths of the side roads (UK and
 ## most of Europe; American centre lines stop at the junction).
 func _centre_through(a: Dictionary, b: Dictionary) -> void:
-	if a.oneway != 0 or b.oneway != 0 or a.phantom or b.phantom or a.rank < 4 or b.rank < 4:
+	if a.oneway != 0 or b.oneway != 0 or a.structure or b.structure or a.rank < 4 or b.rank < 4:
 		return
 	var ma := _mouth(a)
 	var mb := _mouth(b)
@@ -1515,10 +1614,10 @@ func _emit_ring(r: Dictionary) -> void:
 		var d := Vector2.from_angle(k * TAU / seg)
 		var po := centre + d * outer
 		var pi_ := centre + d * maxf(inner, 0.5)
-		var h := surface_at(pi_, r.rank)
+		var h := surface_at(pi_, r.rank, RoadLevels.GRADE_BIT, _terrain_top(pi_))
 		ring_h.append(h)
 		_vert(Vector3(pi_.x, h, pi_.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
-		_vert(Vector3(po.x, surface_at(po, r.rank), po.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		_vert(Vector3(po.x, surface_at(po, r.rank, RoadLevels.GRADE_BIT, h), po.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
 	for k in (seg if not mask_mode else 0):
 		var a := base + k * 2
 		var b := base + ((k + 1) % seg) * 2
@@ -1537,7 +1636,7 @@ func _emit_ring(r: Dictionary) -> void:
 	for arm: Dictionary in r.arms:
 		_ring_mouth(r, arm)
 	# Central island: kerbed and grassed, or just painted when tiny.
-	var hc := surface_at(centre, r.rank)
+	var hc := surface_at(centre, r.rank, RoadLevels.GRADE_BIT, _terrain_top(centre))
 	if inner < 2.5:
 		_disc(centre, maxf(inner, 1.2), hc, PAINT, true)
 		stats.mini += 1
@@ -1594,7 +1693,7 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 		if side > 0.0:
 			for p in curve:
 				poly.append(p)
-				hs.append(surface_at(p, arm.rank))
+				hs.append(surface_at(p, arm.rank, 1 << arm.kind, m.hint))
 		else:
 			# Close the polygon along the ring, inside its outer edge.
 			var a0 := (ends[0] - centre).angle()
@@ -1603,14 +1702,14 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 			for k in range(1, 6):
 				var p := centre + Vector2.from_angle(a0 + span * k / 6.0) * (outer - 0.6)
 				poly.append(p)
-				hs.append(surface_at(p, r.rank) - 0.03)  # under the ring's own surface
+				hs.append(surface_at(p, r.rank, RoadLevels.GRADE_BIT, m.hint) - 0.03)  # under the ring's own surface
 			for p in curve:
 				poly.append(p)
-				hs.append(surface_at(p, arm.rank))
+				hs.append(surface_at(p, arm.rank, 1 << arm.kind, m.hint))
 	if not mask_mode:
 		_fill(poly, hs, arm.color, (m.p as Vector2).lerp(centre, 0.3))
 	var app := _approach(arm)
-	if app != Vector2.ZERO and not arm.phantom:
+	if app != Vector2.ZERO and not arm.structure:
 		_across(arm, maxf(arm.s_exit + 0.3, 0.5), app.x, app.y, 0.25, 0.6, 0.3)
 		stats.give_way += 1
 		if arm.rank >= 4 and arm.cut + 2.0 < arm.len:
