@@ -67,6 +67,9 @@ var _blocks: UrbanBlocks = null
 ## Roads are surfaced by the terrain shader from `road_mask` instead of as meshes:
 ## carriageways, junction and ring surfaces are left out; kerbs, islands and paint stay.
 var mask_mode := false
+## Whether new chunks use the road mask: from ROAM_ROAD_MASK, the page's ?roads=mask, or
+## the settings menu (read by ChunkBuilder on its worker thread; set before building).
+static var use_mask := OS.has_environment("ROAM_ROAD_MASK")
 var road_mask: Image  ## set by build() in mask_mode (see UrbanBlocks.road_mask)
 var _cuttings: Array[Dictionary] = []  # {pts, hw} of roads down in open cuttings
 var _cut_grid := {}  # Vector2i -> Array of _cuttings indices

@@ -7,6 +7,7 @@ extends CanvasLayer
 
 signal teleport_requested(lat: float, lon: float, label: String)
 signal road_teleport_requested(global_pos: Vector3)  ## minimap click: nearest road to here
+signal world_rebuild_requested  ## a setting changed how chunks are built
 
 const NOMINATIM := "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&q=%s"
 const MINIMAP_SPAN := 700.0  # default metres shown across
@@ -70,6 +71,7 @@ var _menu_rows: VBoxContainer
 var _credits_box: VBoxContainer
 var _units_hint: Label
 var _debug_hint: Label
+var _roads_hint: Label
 
 # Launch screen
 var _intro: Control
@@ -242,6 +244,11 @@ func _build_menu() -> void:
 		_save_settings()
 		_update_menu_hints())
 	_debug_hint = _menu_row("Location and fps", "F3", func() -> void: _set_debug(not _debug))
+	_roads_hint = _menu_row("Road surface", "", func() -> void:
+		RoadNetwork.use_mask = not RoadNetwork.use_mask
+		_save_settings()
+		_update_menu_hints()
+		world_rebuild_requested.emit())
 	_menu_row("Data credits", "", func() -> void: _credits_box.visible = not _credits_box.visible)
 	_credits_box = VBoxContainer.new()
 	_credits_box.visible = false
@@ -654,6 +661,13 @@ func _update_menu_hints() -> void:
 		_units_hint.text = "mph" if _mph else "km/h"
 	if _debug_hint:
 		_debug_hint.text = ("On · F3" if _debug else "Off · F3")
+	if _roads_hint:
+		_roads_hint.text = "Mask (beta)" if RoadNetwork.use_mask else "Meshes"
+
+
+## Re-reads settings set from outside the menu (a URL parameter) into its hints.
+func refresh_settings() -> void:
+	_update_menu_hints()
 
 
 func _load_settings() -> void:
@@ -661,12 +675,14 @@ func _load_settings() -> void:
 	if cfg.load(SETTINGS_PATH) == OK:
 		_mph = cfg.get_value("hud", "mph", false)
 		_debug = cfg.get_value("hud", "debug", false)
+		RoadNetwork.use_mask = RoadNetwork.use_mask or cfg.get_value("world", "road_mask", false)
 
 
 func _save_settings() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("hud", "mph", _mph)
 	cfg.set_value("hud", "debug", _debug)
+	cfg.set_value("world", "road_mask", RoadNetwork.use_mask)
 	cfg.save(SETTINGS_PATH)
 
 

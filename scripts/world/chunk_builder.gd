@@ -1523,7 +1523,7 @@ func _build_network() -> RoadNetwork:
 	net.height_at = height_at
 	net.built_up_at = built_up_at
 	net.have_points = _osm_complete
-	net.mask_mode = OS.has_environment("ROAM_ROAD_MASK")
+	net.mask_mode = RoadNetwork.use_mask
 	for i in range(0, _osm_points.size() - 2, 3):
 		var p := Vector2((_osm_points[i] - _merc0[0]) * _scale, (_merc0[1] - _osm_points[i + 1]) * _scale)
 		if p.x > -RoadNetwork.MARGIN and p.y > -RoadNetwork.MARGIN and p.x < size + RoadNetwork.MARGIN 				and p.y < size + RoadNetwork.MARGIN:

@@ -23,6 +23,11 @@ func _ready() -> void:
 	hud.road_teleport_requested.connect(func(target: Vector3) -> void:
 		if not _spawn_pending and not _place_on_road(target, car.global_transform.basis.z, 0.0, 400.0):
 			hud.set_status("No road there yet"))
+	hud.world_rebuild_requested.connect(_rebuild_here)
+	var roads := _url_param("roads")
+	if roads == "mask" or roads == "mesh":
+		RoadNetwork.use_mask = roads == "mask"
+		hud.refresh_settings()
 	var shared := _location_from_url()
 	if not shared.is_empty():
 		_spawn_heading = shared.get("heading", NAN)
@@ -43,6 +48,23 @@ func _location_from_url() -> Dictionary:
 	if parts.size() >= 3 and parts[2].is_valid_float():
 		out.heading = parts[2].to_float()
 	return out
+
+
+## Web only: a ?name=value query parameter of the page URL, or "".
+func _url_param(param: String) -> String:
+	if not OS.has_feature("web"):
+		return ""
+	var js := "new URLSearchParams(window.location.search).get('%s') || ''" % param
+	return str(JavaScriptBridge.eval(js, true))
+
+
+## Rebuilds every chunk around the car (after a setting that changes how they are
+## built), keeping its place and heading.
+func _rebuild_here() -> void:
+	var ll := Geo.local_to_latlon(car.global_position)
+	var f := car.global_transform.basis.z
+	_spawn_heading = fposmod(rad_to_deg(atan2(f.x, -f.z)), 360.0)
+	teleport(ll.x, ll.y, "%.5f, %.5f" % [ll.x, ll.y])
 
 
 ## Keeps the page URL pointing at the car, so it can be copied and shared.
