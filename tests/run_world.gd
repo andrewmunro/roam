@@ -2,6 +2,8 @@ extends Node
 ## Loads the main scene, lets it stream, and reports progress. Optionally drives
 ## forward and saves screenshots (when not headless).
 ## Run: godot --path . res://tests/run_world.tscn [-- --shots=dir --drive]
+## --latlon=lat,lon --heading=deg spawn like a shared link; --cam=lat,lon,h,heading,pitch
+## (repeatable) places the camera for each shot in turn (h above whatever the ray hits).
 ## --touch shows the touch controls; --touch-drive also drives with simulated touches
 ## (gas pedal, then the steering stick pushed right).
 
@@ -18,6 +20,7 @@ var _aerial_tilt := 0.35
 var _target := Vector2.ZERO  # requested lat/lon
 var _look_around := false
 var _look_tunnel := false
+var _cams: Array[PackedFloat64Array] = []  # --cam=lat,lon,h,heading,pitch (repeatable): one per shot
 var _map_click := Vector2.INF  # --map-click=dx,dy: simulated minimap click (pixels from centre)
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
 var _checked := false
@@ -72,6 +75,11 @@ func _ready() -> void:
 			_aerial = parts[0].to_float()
 			if parts.size() > 1:
 				_aerial_tilt = parts[1].to_float()
+		elif a.begins_with("--cam="):
+			var c := PackedFloat64Array()
+			for v in a.substr(6).split(","):
+				c.append(v.to_float())
+			_cams.append(c)
 		elif a.begins_with("--every="):
 			_report_every = a.substr(8).to_float()
 	_main = load("res://scenes/main.tscn").instantiate()
@@ -82,6 +90,8 @@ func _ready() -> void:
 			_main.start_lon = ll[1].to_float()
 			_main.start_label = a.substr(9)
 			_target = Vector2(ll[0].to_float(), ll[1].to_float())
+		elif a.begins_with("--heading="):
+			_main._spawn_heading = a.substr(10).to_float()
 	add_child(_main)
 	_last = Time.get_ticks_usec()
 
@@ -196,12 +206,37 @@ func _process(delta: float) -> void:
 			var yaw := _shot_idx * PI / 2.0
 			cam.global_position = car.global_position + Vector3(0, 8, 0)
 			cam.look_at(cam.global_position + Vector3(sin(yaw), -0.15, cos(yaw)), Vector3.UP)
-		if not _shots.is_empty() and not car.freeze:
-			var img := get_viewport().get_texture().get_image()
-			img.save_png(_shots.path_join("shot_%02d.png" % _shot_idx))
+		# Shots wait for streaming to settle (software rendering is slow to catch up).
+		var settled: bool = not car.freeze and not (_main.get_node("World") as WorldStreamer).is_loading()
+		if not _cams.is_empty() and settled:
+			_place_cam(_cams[mini(_shot_idx, _cams.size() - 1)])
+		if not _shots.is_empty() and settled:
+			_save_shot(_shots.path_join("shot_%02d.png" % _shot_idx))
 			_shot_idx += 1
 	if _t > float(OS.get_environment("RUN_SECONDS") if OS.has_environment("RUN_SECONDS") else "40"):
 		get_tree().quit()
+
+
+## Puts the camera h metres above the ground (or road) at lat,lon, looking along heading
+## (degrees clockwise from north) and pitch (degrees, negative looks down).
+func _place_cam(c: PackedFloat64Array) -> void:
+	var cam: Camera3D = _main.get_node("Camera")
+	cam.set_process(false)
+	var p := Geo.latlon_to_local(c[0], c[1])
+	var hit := cam.get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(
+		p + Vector3.UP * 500, p - Vector3.UP * 500))
+	p.y = (hit.position.y if not hit.is_empty() else 0.0) + c[2]
+	var yaw := deg_to_rad(c[3])
+	var pitch := deg_to_rad(c[4])
+	cam.global_position = p
+	cam.look_at(p + Vector3(sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch)), Vector3.UP)
+
+
+## Saves the viewport once the frame with this frame's camera moves has been drawn.
+func _save_shot(path: String) -> void:
+	await RenderingServer.frame_post_draw
+	get_viewport().get_texture().get_image().save_png(path)
+	print("shot: ", path)
 
 
 ## Drives with simulated screen touches on the floating stick: a finger lands mid-screen

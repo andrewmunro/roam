@@ -59,7 +59,7 @@ func finalize_step() -> bool:
 	var b := _builder
 	match _finalize_step:
 		0:
-			_add_mesh("Terrain", _array_mesh(b.terrain, true), _terrain_material_for(b.portal_boxes), 1)
+			_add_mesh("Terrain", _array_mesh(b.terrain, true), _terrain_material_for(b), 1)
 			if not b.collision.is_empty():
 				_heights = b.collision.heights
 				_grid_n = b.collision.width
@@ -117,15 +117,20 @@ const TERRAIN_LAYER := 2  ## physics layer bit for terrain (cars ignore it insid
 
 
 ## The shared terrain material, or a copy that cuts holes where tunnels meet the surface.
-func _terrain_material_for(portals: Array[Transform3D]) -> ShaderMaterial:
-	if portals.is_empty():
+func _terrain_material_for(b: ChunkBuilder) -> ShaderMaterial:
+	if b.mouth_boxes.is_empty() and b.cut_mask == null:
 		return terrain_material
 	var m: ShaderMaterial = terrain_material.duplicate()
 	var inv: Array[Projection] = []
-	for i in mini(portals.size(), MAX_PORTALS):
-		inv.append(Projection(portals[i].affine_inverse()))
+	for i in mini(b.mouth_boxes.size(), MAX_PORTALS):
+		inv.append(Projection(b.mouth_boxes[i].affine_inverse()))
 	m.set_shader_parameter("portal_count", inv.size())
 	m.set_shader_parameter("portals", inv)
+	if b.cut_mask != null:
+		m.set_shader_parameter("has_cut", true)
+		m.set_shader_parameter("cut_mask", ImageTexture.create_from_image(b.cut_mask))
+		m.set_shader_parameter("cut_size", b.size)
+		m.set_shader_parameter("cut_base", b.cut_base)
 	return m
 
 

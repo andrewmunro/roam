@@ -3,3 +3,6 @@
 /android/
 *.unitypackage
 /build/
+
+# Claude Code agent worktrees
+.claude/worktrees/
