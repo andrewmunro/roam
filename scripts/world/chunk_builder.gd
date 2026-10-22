@@ -2381,8 +2381,13 @@ static func _parse_colour(value: Variant) -> Variant:
 	return c
 
 
-## Walls get UV = (metres along the perimeter, metres above ground) for the facade
-## shader; UV2 = (building height, per-building random); COLOR.a = 1 walls, 0 roof.
+const BAY := 3.0  # target window bay width (m)
+const BAY_MIN := 1.6  # walls shorter than this get no windows
+
+
+## Walls get UV = (window bays along the wall, metres above ground) for the facade
+## shader; UV2 = (building height, bays + per-building random fraction);
+## COLOR.a = 1 walls, 0 roof.
 func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Color, key: int,
 		verts: PackedVector3Array, normals: PackedVector3Array, colors: PackedColorArray,
 		uvs: PackedVector2Array, uv2s: PackedVector2Array) -> void:
@@ -2401,8 +2406,7 @@ func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Colo
 	var roof: Color = regional_roof if regional_roof != null else color.darkened(0.35)
 	roof.a = 0.0
 	color.a = 1.0
-	var info := Vector2(height - min_h, (key % 1000) / 1000.0)
-	var along := 0.0
+	var rnd := (key % 1000) / 1000.0
 	var n := poly.size()
 	var ccw := MVTDecoder.ring_area(poly) > 0.0  # counter-clockwise in x/z maths sense
 	for i in n:
@@ -2416,27 +2420,30 @@ func _extrude(poly: PackedVector2Array, min_h: float, height: float, color: Colo
 		var out := Vector2(edge.y, -edge.x) if ccw else Vector2(-edge.y, edge.x)
 		var nrm := Vector3(out.x, 0, out.y).normalized()
 		var len := edge.length()
-		# Start each wall on a whole window bay so windows don't straddle corners.
-		var u0 := ceilf(along / 3.0) * 3.0
-		along = u0 + len
+		# Each wall holds a whole number of window bays (none on slivers), so windows
+		# never straddle a corner. UV.x runs 0..bays along the wall; the bay count
+		# rides in UV2.y's integer part, the building's random number in its fraction.
+		var bays := 0 if len < BAY_MIN else maxi(1, roundi(len / BAY))
+		var info := Vector2(height - min_h, bays + 0.05 + rnd * 0.9)
 		var v0 := bottom - ground - min_h
 		var v1 := height - min_h
-		var ua0 := Vector2(u0, v0)
-		var ub0 := Vector2(u0 + len, v0)
-		var ua1 := Vector2(u0, v1)
-		var ub1 := Vector2(u0 + len, v1)
+		var ua0 := Vector2(0, v0)
+		var ub0 := Vector2(bays, v0)
+		var ua1 := Vector2(0, v1)
+		var ub1 := Vector2(bays, v1)
 		_tri(a0, b0, b1, nrm, color, verts, normals, colors, uvs, uv2s, [ua0, ub0, ub1], info)
 		_tri(a0, b1, a1, nrm, color, verts, normals, colors, uvs, uv2s, [ua0, ub1, ua1], info)
 		var bs := size / BLOCKS
 		var block := clampi(int(a.y / bs), 0, BLOCKS - 1) * BLOCKS + clampi(int(a.x / bs), 0, BLOCKS - 1)
 		building_faces[block].append_array([a0, b0, b1, a0, b1, a1])
 	var idx := Geometry2D.triangulate_polygon(poly)
+	var roof_info := Vector2(height - min_h, 0.05 + rnd * 0.9)
 	for t in range(0, idx.size(), 3):
 		var p0 := poly[idx[t]]
 		var p1 := poly[idx[t + 1]]
 		var p2 := poly[idx[t + 2]]
 		_tri(Vector3(p0.x, top, p0.y), Vector3(p1.x, top, p1.y), Vector3(p2.x, top, p2.y),
-			Vector3.UP, roof, verts, normals, colors, uvs, uv2s, [p0, p1, p2], info)
+			Vector3.UP, roof, verts, normals, colors, uvs, uv2s, [p0, p1, p2], roof_info)
 
 
 ## Appends a triangle facing `nrm` (Godot front faces are clockwise).
