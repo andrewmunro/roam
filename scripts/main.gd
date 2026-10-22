@@ -64,6 +64,7 @@ func teleport(lat: float, lon: float, label: String) -> void:
 	car.global_transform = Transform3D(Basis.IDENTITY, Vector3.ZERO)
 	_spawn_pending = true
 	hud.set_status("Loading %s…" % label)
+	hud.arrive(label)
 
 
 func _physics_process(delta: float) -> void:

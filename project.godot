@@ -38,3 +38,7 @@ renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
 lights_and_shadows/directional_shadow/size=2048
 anti_aliasing/quality/msaa_3d=0
+
+[gui]
+
+theme/custom_font="res://assets/fonts/manrope_medium.tres"

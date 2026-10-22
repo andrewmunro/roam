@@ -4,6 +4,9 @@ extends Node
 ## Run: godot --path . res://tests/run_world.tscn [-- --shots=dir --drive]
 ## --latlon=lat,lon --heading=deg spawn like a shared link; --cam=lat,lon,h,heading,pitch
 ## (repeatable) places the camera for each shot in turn (h above whatever the ray hits).
+## --no-hud hides the HUD (clean backdrops for UI mockups); --ui=menu, --ui=search:<query> or
+## --ui=arrive:<place> (the place name and credits shown after a teleport)
+## opens that HUD panel once the world has loaded.
 ## --touch shows the touch controls; --touch-drive also drives with simulated touches
 ## (gas pedal, then the steering stick pushed right).
 
@@ -20,6 +23,8 @@ var _aerial_tilt := 0.35
 var _target := Vector2.ZERO  # requested lat/lon
 var _look_around := false
 var _look_tunnel := false
+var _no_hud := false
+var _ui := ""  # --ui=search:<query> or --ui=menu: opens that HUD panel once the world is ready
 var _cams: Array[PackedFloat64Array] = []  # --cam=lat,lon,h,heading,pitch (repeatable): one per shot
 var _map_click := Vector2.INF  # --map-click=dx,dy: simulated minimap click (pixels from centre)
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
@@ -80,6 +85,10 @@ func _ready() -> void:
 			for v in a.substr(6).split(","):
 				c.append(v.to_float())
 			_cams.append(c)
+		elif a.begins_with("--ui="):
+			_ui = a.substr(5)
+		elif a == "--no-hud":
+			_no_hud = true
 		elif a.begins_with("--every="):
 			_report_every = a.substr(8).to_float()
 	_main = load("res://scenes/main.tscn").instantiate()
@@ -93,6 +102,8 @@ func _ready() -> void:
 		elif a.begins_with("--heading="):
 			_main._spawn_heading = a.substr(10).to_float()
 	add_child(_main)
+	if _no_hud:
+		_main.get_node("HUD").visible = false
 	_last = Time.get_ticks_usec()
 
 func _process(delta: float) -> void:
@@ -208,6 +219,18 @@ func _process(delta: float) -> void:
 			cam.look_at(cam.global_position + Vector3(sin(yaw), -0.15, cos(yaw)), Vector3.UP)
 		# Shots wait for streaming to settle (software rendering is slow to catch up).
 		var settled: bool = not car.freeze and not (_main.get_node("World") as WorldStreamer).is_loading()
+		if not _ui.is_empty() and settled:
+			var hud: Node = _main.get_node("HUD")
+			if _ui == "menu":
+				hud._set_menu_open(true)
+				hud._credits_box.visible = true
+			elif _ui.begins_with("arrive:"):
+				hud.arrive(_ui.substr(7))
+			elif _ui.begins_with("search:"):
+				hud._open_search()
+				hud._search.text = _ui.substr(7)
+				hud._on_submit(_ui.substr(7))
+			_ui = ""
 		if not _cams.is_empty() and settled:
 			_place_cam(_cams[mini(_shot_idx, _cams.size() - 1)])
 		if not _shots.is_empty() and settled:

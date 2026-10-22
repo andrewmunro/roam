@@ -249,6 +249,9 @@ static func _ensure_input_actions() -> void:
 		"boost": [_key(KEY_SHIFT), _button(JOY_BUTTON_X)],
 		"reset_car": [_key(KEY_R), _button(JOY_BUTTON_Y)],
 		"toggle_map": [_key(KEY_M)],
+		"toggle_help": [_key(KEY_H)],
+		"toggle_debug": [_key(KEY_F3)],
+		"open_search": [_key(KEY_SLASH)],
 	}
 	for action: String in actions:
 		if InputMap.has_action(action):

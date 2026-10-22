@@ -3,8 +3,8 @@ extends Control
 ## On-screen driving controls for touch screens. The first finger that lands anywhere
 ## (except on HUD widgets or the small buttons) becomes a floating joystick centred
 ## under it, drawn only while held: X steers, up accelerates, down brakes and then
-## reverses. Small handbrake/boost/reset buttons sit in the corners. They press the
-## regular input actions, so the car can't tell them from a keyboard or gamepad.
+## reverses. Round handbrake/boost/reset pads sit in a column on the right. They press
+## the regular input actions, so the car can't tell them from a keyboard or gamepad.
 ## Shown on touch devices (or on the first touch); hidden again by keyboard/gamepad use.
 
 signal active_changed(active: bool)
@@ -12,21 +12,23 @@ signal active_changed(active: bool)
 ## Sizes are in CSS pixels (points) and converted to canvas units, so the controls are
 ## the same physical size on any screen density or stretch factor.
 const STICK_RADIUS := 62.0
-const KNOB_RADIUS := 27.0
-const SMALL_SIZE := Vector2(86, 40)
-const RESET_SIZE := Vector2(70, 36)
-const MARGIN := 16.0
+const KNOB_RADIUS := 24.0
+const PAD_RADIUS := 32.0
+const RESET_RADIUS := 22.0
+const MARGIN := 18.0
 const GAP := 14.0
-const FONT_SIZE := 12.0
+const FONT_SIZE := 10.5
 const STICK_DEADZONE := 0.12
 
-const FILL := Color(0, 0, 0, 0.3)
-const FILL_PRESSED := Color(1, 1, 1, 0.32)
-const EDGE := Color(1, 1, 1, 0.55)
-const TEXT_OUTLINE := Color(0, 0, 0, 0.8)
+const EDGE := Color(1, 1, 1, 0.42)
 
-## Canvas units kept free along the bottom edge (for the map credit line).
-@export var bottom_reserve := 22.0
+## Canvas units kept free along the bottom edge.
+@export var bottom_reserve := 12.0
+## Shows a ghost stick where a thumb naturally lands, until the player starts driving.
+var hint := false:
+	set(value):
+		hint = value
+		queue_redraw()
 ## HUD widgets (search, minimap…) that keep their touches instead of starting the stick.
 var exclude: Array[Control] = []
 
@@ -47,9 +49,9 @@ func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	for id: String in ["handbrake", "boost", "reset_car"]:
 		_buttons[id] = {rect = Rect2(), touches = [] as Array[int], action = id}
-	_buttons.handbrake.label = "HANDBRAKE"
+	_buttons.handbrake.label = "HAND\nBRAKE"
 	_buttons.boost.label = "BOOST"
-	_buttons.reset_car.label = "RESET"
+	_buttons.reset_car.label = ""  # drawn as an icon
 	get_viewport().size_changed.connect(_layout)
 	_layout()
 	set_active(DisplayServer.is_touchscreen_available())
@@ -81,7 +83,7 @@ func _layout() -> void:
 	if vp.x <= 0.0 or win.x <= 0.0:
 		return
 	var dpr := maxf(DisplayServer.screen_get_scale(), 1.0)
-	_px = vp.x / (win.x / dpr)
+	_px = clampf(vp.x / (win.x / dpr), 0.5, 4.0)  # (headless test windows are tiny)
 	# Shrink a little on very small screens so everything still fits.
 	var css := vp / _px
 	_px *= clampf(minf(css.x / 400.0, css.y / 340.0), 0.7, 1.0)
@@ -94,14 +96,18 @@ func _layout() -> void:
 		_margin.y = maxf(_margin.y, safe.position.y * k)
 		_margin.z = maxf(_margin.z, (screen.x - safe.end.x) * k)
 		_margin.w = maxf(_margin.w, (screen.y - safe.end.y) * k)
-	var bottom := vp.y - _margin.w - bottom_reserve
-	var small := SMALL_SIZE * _px
+	var bottom := vp.y - _margin.w - bottom_reserve * _px
+	var pad := PAD_RADIUS * _px
 	var gap := GAP * _px
-	var boost_pos := Vector2(vp.x - _margin.z - small.x, bottom - small.y)
-	_buttons.boost.rect = Rect2(boost_pos, small)
-	_buttons.handbrake.rect = Rect2(Vector2(boost_pos.x, boost_pos.y - gap - small.y), small)
-	var reset := RESET_SIZE * _px
-	_buttons.reset_car.rect = Rect2(Vector2(_margin.x, bottom - reset.y), reset)
+	# Right-hand column, thumb-reachable from the bottom: handbrake, boost, then reset.
+	var x := vp.x - _margin.z - pad
+	var brake := Vector2(x, bottom - pad)
+	var boost := brake - Vector2(0, 2.0 * pad + gap)
+	var small := RESET_RADIUS * _px
+	var reset := Vector2(x, boost.y - pad - gap - small)
+	_buttons.handbrake.rect = Rect2(brake - Vector2.ONE * pad, Vector2.ONE * 2.0 * pad)
+	_buttons.boost.rect = Rect2(boost - Vector2.ONE * pad, Vector2.ONE * 2.0 * pad)
+	_buttons.reset_car.rect = Rect2(reset - Vector2.ONE * small, Vector2.ONE * 2.0 * small)
 	queue_redraw()
 
 
@@ -232,36 +238,51 @@ func _release_all() -> void:
 
 
 func _draw() -> void:
-	var font := get_theme_default_font()
-	var fs := int(FONT_SIZE * _px)
+	var fs := maxi(roundi(FONT_SIZE * _px), 8)
 	var line := maxf(1.5 * _px, 1.0)
+	var r := STICK_RADIUS * _px
 	if _stick_touch != -1:
 		# Joystick: base ring with throttle/brake/steer chevrons and the knob under the finger.
-		var r := STICK_RADIUS * _px
-		draw_circle(_stick_centre, r, FILL)
-		draw_arc(_stick_centre, r, 0.0, TAU, 48, EDGE, line, true)
-		for dir: Vector2 in [Vector2.LEFT, Vector2.RIGHT, Vector2.UP, Vector2.DOWN]:
-			var tip := _stick_centre + dir * r * 0.82
-			var back := tip - dir * r * 0.16
-			var side := Vector2(-dir.y, dir.x) * r * 0.16
-			draw_polyline(PackedVector2Array([back + side, tip, back - side]), EDGE, line * 1.4, true)
+		draw_circle(_stick_centre, r, HudStyle.GLASS, true, -1.0, true)
+		draw_arc(_stick_centre, r, 0.0, TAU, 64, EDGE, line, true)
+		_draw_chevrons(_stick_centre, r, line)
 		var knob := _stick_centre + _stick.limit_length(1.0) * r
-		draw_circle(knob, KNOB_RADIUS * _px, FILL_PRESSED)
+		draw_circle(knob, KNOB_RADIUS * _px, HudStyle.GLASS_PRESSED, true, -1.0, true)
 		draw_arc(knob, KNOB_RADIUS * _px, 0.0, TAU, 32, Color(1, 1, 1, 0.75), line, true)
-	var box := StyleBoxFlat.new()
-	box.set_corner_radius_all(int(12 * _px))
-	box.set_border_width_all(int(maxf(1.5 * _px, 1.0)))
-	box.border_color = EDGE
-	box.anti_aliasing = true
+	elif hint:
+		# Ghost stick: a dashed ring with a knob, lower left where a left thumb rests.
+		var c := Vector2(_margin.x + r + 28.0 * _px, get_viewport_rect().size.y - _margin.w - r - 96.0 * _px)
+		for i in 32:
+			var a0 := i * TAU / 32.0
+			draw_arc(c, r, a0, a0 + TAU / 64.0, 4, Color(1, 1, 1, 0.6), line, true)
+		_draw_chevrons(c, r, line)
+		draw_circle(c, KNOB_RADIUS * _px, Color(1, 1, 1, 0.2), true, -1.0, true)
+		draw_arc(c, KNOB_RADIUS * _px, 0.0, TAU, 32, Color(1, 1, 1, 0.5), line, true)
 	for id: String in _buttons:
 		var b: Dictionary = _buttons[id]
-		box.bg_color = FILL_PRESSED if not b.touches.is_empty() else FILL
-		draw_style_box(box, b.rect)
-		_draw_text(font, fs, b.label, b.rect.get_center())
+		var rect: Rect2 = b.rect
+		var c := rect.get_center()
+		var rad := rect.size.x * 0.5
+		draw_circle(c, rad, HudStyle.GLASS_PRESSED if not b.touches.is_empty() else HudStyle.GLASS, true, -1.0, true)
+		draw_arc(c, rad - 0.5, 0.0, TAU, 48, EDGE, line, true)
+		if id == "reset_car":
+			# Circular arrow.
+			var k := rad * 0.45
+			draw_arc(c, k, -PI * 0.35, PI * 1.35, 24, HudStyle.INK, line * 1.3, true)
+			var tip := c + Vector2.from_angle(-PI * 0.35) * k
+			draw_colored_polygon(PackedVector2Array([tip + Vector2(-0.1, -0.55) * k, tip + Vector2(0.55, 0.15) * k,
+				tip + Vector2(-0.45, 0.35) * k]), HudStyle.INK)
+			continue
+		var rows: PackedStringArray = str(b.label).split("\n")
+		var step := fs * 1.15
+		for i in rows.size():
+			var y := c.y + (i - (rows.size() - 1) * 0.5) * step
+			HudStyle.draw_text_centred(self, Vector2(c.x, y), rows[i], fs, HudStyle.BOLD, HudStyle.INK, _px)
 
 
-func _draw_text(font: Font, fs: int, text: String, centre: Vector2) -> void:
-	var sz := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs)
-	var pos := Vector2(centre.x - sz.x * 0.5, centre.y - sz.y * 0.5 + font.get_ascent(fs))
-	draw_string_outline(font, pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, maxi(int(4 * _px), 2), TEXT_OUTLINE)
-	draw_string(font, pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color.WHITE)
+func _draw_chevrons(centre: Vector2, r: float, line: float) -> void:
+	for dir: Vector2 in [Vector2.LEFT, Vector2.RIGHT, Vector2.UP, Vector2.DOWN]:
+		var tip := centre + dir * r * 0.82
+		var back := tip - dir * r * 0.16
+		var side := Vector2(-dir.y, dir.x) * r * 0.16
+		draw_polyline(PackedVector2Array([back + side, tip, back - side]), EDGE, line * 1.4, true)
