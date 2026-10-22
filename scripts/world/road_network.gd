@@ -51,7 +51,7 @@ var paved: Array[Dictionary] = []  ## own edges with pavements: {pts, hw}
 var ring_zones: Array[Vector3] = []  ## roundabouts: (centre x, centre z, outer radius)
 ## No parking near junctions: {pts, hw} strips from each junction along its arms.
 var no_park: Array[Dictionary] = []
-var stats := {junctions = 0, roundabouts = 0, signals = 0, mini = 0, give_way = 0, stops = 0}
+var stats := {junctions = 0, roundabouts = 0, signals = 0, mini = 0, give_way = 0, stops = 0, blocks = 0}
 var signal_spots: Array[Vector2] = []  ## centres of signalised junctions (for tests)
 
 var _lines: Array[Dictionary] = []
@@ -63,6 +63,7 @@ var _ring_of_node := PackedInt32Array()
 var _rings: Array[Dictionary] = []
 var _clusters: Array[Dictionary] = []
 var _seg_grid := {}  # Vector2i -> Array of edge ids
+var _blocks: UrbanBlocks = null
 var _cuttings: Array[Dictionary] = []  # {pts, hw} of roads down in open cuttings
 var _cut_grid := {}  # Vector2i -> Array of _cuttings indices
 var _pt_grid := {}  # Vector2i -> Array of point indices
@@ -114,6 +115,8 @@ func build() -> void:
 		_ring_cuts(r)
 	for c in _clusters:
 		_cluster_cuts(c)
+	if not OS.has_environment("ROAM_NO_BLOCKS"):
+		_build_blocks()
 	tm.append(Time.get_ticks_usec())
 	for r in _rings:
 		if _owned(r.centre):
@@ -132,7 +135,7 @@ func build() -> void:
 		out.append((t - last) / 1000)
 		last = t
 	if OS.has_environment("ROAM_ROAD_TIMES"):
-		print("road network ms (graph, rings, grids, cuts, junctions, edges): ", out)
+		print("road network ms (graph, rings, grids, cuts + blocks, junctions, edges): ", out)
 
 
 func _owned(p: Vector2) -> bool:
@@ -996,8 +999,9 @@ func _kerb(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Ar
 	clear.resize(n)
 	for k in n:
 		if k % 3 == 0 or k == n - 1:
-			clear[k] = not _on_other_road(pts[k] + out[k] * (PAVEMENT * 0.75), skip) \
-				and not _over_cutting(pts[k] + out[k] * (PAVEMENT + 0.5))
+			var q := pts[k] + out[k] * (PAVEMENT * 0.75)
+			clear[k] = not _on_other_road(q, skip) and not _over_cutting(pts[k] + out[k] * (PAVEMENT + 0.5)) \
+				and not (_blocks != null and _blocks.covers(q))  # the block's own kerb is there
 	for k in n:
 		if k % 3 != 0 and k != n - 1:
 			clear[k] = clear[k - k % 3] and clear[mini(k - k % 3 + 3, n - 1)]
@@ -1046,6 +1050,105 @@ func _kerb_run(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVecto
 		var off := base + k * 5
 		for q in quads:
 			indices.append(off + q)
+
+
+# --- City blocks ------------------------------------------------------------------------
+
+## Traces the blocks between at-grade streets (see UrbanBlocks) and gives each block
+## this tile owns one kerb and pavement round its edge. Road edge and junction kerbs
+## then leave out the stretches a block already covers.
+func _build_blocks() -> void:
+	var roads: Array[Dictionary] = []
+	for e in _edges:
+		if not e.phantom and e.rank >= 4:
+			roads.append({pts = e.pts, hw = e.hw, rank = e.rank, pave = e.pave, color = e.color})
+	var in_ring := func(p: Vector2) -> bool:
+		for z: Vector3 in ring_zones:
+			if p.distance_to(Vector2(z.x, z.y)) < z.z:
+				return true
+		return false
+	_blocks = UrbanBlocks.new()
+	_blocks.build(size, roads, _cuttings, in_ring)
+	for poly in _blocks.blocks:
+		if _owned(UrbanBlocks._centroid(poly)):
+			_block_kerb(poly)
+			stats.blocks += 1
+
+
+func _block_kerb(poly: PackedVector2Array) -> void:
+	# Points every 6 m or so, enough for the kerb to follow the ground.
+	var pts := PackedVector2Array()
+	var n0 := poly.size()
+	for k in n0:
+		var a := poly[k]
+		var b := poly[(k + 1) % n0]
+		var steps := maxi(1, ceili(a.distance_to(b) / 6.0))
+		for s in steps:
+			pts.append(a.lerp(b, float(s) / steps))
+	var n := pts.size()
+	var out := PackedVector2Array()  # into the block
+	var hs := PackedFloat32Array()
+	var paved: Array[bool] = []
+	var ranks := PackedInt32Array()
+	for k in n:
+		var d0 := (pts[k] - pts[(k - 1 + n) % n]).normalized()
+		var d1 := (pts[(k + 1) % n] - pts[k]).normalized()
+		var inward := (Vector2(-d0.y, d0.x) + Vector2(-d1.y, d1.x)).normalized()
+		out.append(inward)
+		var road := _blocks.road_beside(pts[k], -inward)
+		var rank := 4 if road == UrbanBlocks.FREE else road & 31
+		paved.append(road != UrbanBlocks.FREE and road & UrbanBlocks.UNPAVED == 0)
+		ranks.append(rank)
+		hs.append(maxf(height_at.call(pts[k]), height_at.call(pts[k] - inward * 2.5)) + _lift(rank))
+	_apron(pts, hs, out, ranks, paved)
+	# Start at an unpaved point so no run wraps past the end; all paved: close the ring.
+	var start := paved.find(false)
+	if start < 0:
+		pts.append(pts[0])
+		out.append(out[0])
+		hs.append(hs[0])
+		_kerb_run(pts, hs, out, 0, n + 1)
+		return
+	var rp := PackedVector2Array()
+	var ro := PackedVector2Array()
+	var rh := PackedFloat32Array()
+	var rpaved: Array[bool] = []
+	for k in n:
+		var i := (start + k) % n
+		rp.append(pts[i])
+		ro.append(out[i])
+		rh.append(hs[i])
+		rpaved.append(paved[i])
+	var run_start := -1
+	for k in n + 1:
+		var ok := k < n and rpaved[k]
+		if ok and run_start < 0:
+			run_start = k
+		elif not ok and run_start >= 0:
+			if k - run_start >= 2:
+				_kerb_run(rp, rh, ro, run_start, k)
+			run_start = -1
+
+
+const APRON := 6.0  ## asphalt laid outwards from a block's kerb
+
+
+## Asphalt round the outside of a block, just under the road surfaces: fills the
+## corners junction surfaces leave open (a straight edge where there is no curve).
+func _apron(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Array, ranks: PackedInt32Array,
+		paved: Array[bool]) -> void:
+	var n := pts.size()
+	var base := verts.size()
+	for k in n:
+		var color: Color = _blocks.colors.get(ranks[k], Color(0.47, 0.47, 0.48))
+		var q := pts[k] - out[k] * APRON
+		_vert(Vector3(pts[k].x, hs[k] - 0.04, pts[k].y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		_vert(Vector3(q.x, hs[k] - 0.04, q.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+	for k in n:
+		var a := base + k * 2
+		var b := base + ((k + 1) % n) * 2
+		if paved[k] and paved[(k + 1) % n]:  # not over cuttings and motorways
+			_quad(a, b, b + 1, a + 1)
 
 
 # --- Junction surfaces ------------------------------------------------------------------
