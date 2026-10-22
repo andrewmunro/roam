@@ -512,6 +512,8 @@ const LAYER_HEIGHT := 6.0
 const TUNNEL_HEIGHT := 6.0
 const TUNNEL_COVER := 7.0  # road must be this far under the surface inside a tunnel
 const TUNNEL_MIN_RELIEF := 10.0
+const MIN_RETAIN := 0.4  # a cutting wall stands only where its side is this far above the road
+const DECK_DROP := 0.4  # a dug-down tunnel's roof deck sits this far under the surface
 const MAX_GRADE := 0.06  # steepest bridge/tunnel approach
 const ENVELOPE := 12.0
 
@@ -1535,6 +1537,8 @@ func _build_network() -> RoadNetwork:
 	for road in _road_lines:
 		if (road.bridge or road.tunnel) and ROADS[road.cls][1] >= NETWORK_RANK:
 			add.call(road, true, true)
+		if road.get("open", false):
+			net.add_cutting(road.pts, ROADS[road.cls][0])
 	net.build()
 	return net
 
@@ -1756,11 +1760,16 @@ func _build_tunnel(pts: PackedVector2Array, heights: PackedFloat32Array, hw: flo
 	var n := pts.size()
 	# Per point: ground height along both walls, and whether there is a roof.
 	var ground := PackedFloat32Array()
+	var side_ground: Array[PackedFloat32Array] = [PackedFloat32Array(), PackedFloat32Array()]
 	var covered: Array[bool] = []
 	for k in n:
 		var d := (pts[mini(k + 1, n - 1)] - pts[maxi(k - 1, 0)]).normalized()
-		var side := Vector2(-d.y, d.x) * wall
-		var g := maxf(height_at(pts[k] + side), height_at(pts[k] - side))
+		var side := Vector2(-d.y, d.x)
+		for si in 2:
+			var s := 1.0 if si == 0 else -1.0
+			side_ground[si].append(maxf(height_at(pts[k] + side * s * wall),
+				height_at(pts[k] + side * s * (wall + 2.0))))
+		var g := maxf(side_ground[0][k], side_ground[1][k])
 		ground.append(maxf(g, height_at(pts[k])))
 		covered.append(not open and (sunk or height_at(pts[k]) >= heights[k] + TUNNEL_HEIGHT + 0.5))
 	# Walls left out beside another cutting, per segment and side; short stretches kept
@@ -1799,8 +1808,6 @@ func _build_tunnel(pts: PackedVector2Array, heights: PackedFloat32Array, hw: flo
 		_tunnel_segments.append({a = a, b = b, ha = ya, hb = yb, wall = wall})
 		var roof := covered[k - 1] and covered[k]
 		var max_top := TUNNEL_COVER + 2.0
-		var top_a := TUNNEL_HEIGHT if roof else clampf(ground[k - 1] - ya + 0.5, 1.0, max_top)
-		var top_b := TUNNEL_HEIGHT if roof else clampf(ground[k] - yb + 0.5, 1.0, max_top)
 		var skip := [false, false]
 		for si in 2:
 			var s := 1.0 if si == 0 else -1.0
@@ -1813,11 +1820,22 @@ func _build_tunnel(pts: PackedVector2Array, heights: PackedFloat32Array, hw: flo
 			var e1 := b + side * s * (hw - 0.2)
 			var f0 := a + side * s * reach
 			var f1 := b + side * s * reach
-			_s_quad(Vector3(e0.x, ya + 0.05, e0.y), Vector3(e1.x, yb + 0.05, e1.y), Vector3(f1.x, yb + 0.05, f1.y),
-				Vector3(f0.x, ya + 0.05, f0.y), Vector3.UP, SHOULDER, true)
+			# A touch below the road surface, so where it reaches under a neighbouring
+			# carriageway that road's own surface stays on top.
+			_s_quad(Vector3(e0.x, ya - 0.02, e0.y), Vector3(e1.x, yb - 0.02, e1.y), Vector3(f1.x, yb - 0.02, f1.y),
+				Vector3(f0.x, ya - 0.02, f0.y), Vector3.UP, SHOULDER, true)
 			if skip[si]:
 				skipped[si] = true
 				continue
+			# Each wall retains only the ground on its own side, with a low parapet; where
+			# that side is barely above the road (a shallow end, or a road beside it at
+			# street level) there is nothing to retain and no wall.
+			var depth_a := side_ground[si][k - 1] - ya
+			var depth_b := side_ground[si][k] - yb
+			if not roof and maxf(depth_a, depth_b) < MIN_RETAIN:
+				continue
+			var top_a := TUNNEL_HEIGHT if roof else clampf(depth_a + 0.5, 0.3, max_top)
+			var top_b := TUNNEL_HEIGHT if roof else clampf(depth_b + 0.5, 0.3, max_top)
 			var pa := a + side * s * wall
 			var pb := b + side * s * wall
 			var inward := Vector3(-side.x * s, 0, -side.y * s)
@@ -1836,7 +1854,19 @@ func _build_tunnel(pts: PackedVector2Array, heights: PackedFloat32Array, hw: flo
 			var cb := yb + TUNNEL_HEIGHT
 			var ceiling := [Vector3(l0.x, ca, l0.y), Vector3(l1.x, cb, l1.y), Vector3(r1.x, cb, r1.y), Vector3(r0.x, ca, r0.y)]
 			_s_quad(ceiling[0], ceiling[1], ceiling[2], ceiling[3], Vector3.DOWN, TUNNEL_WALL)
-			_s_quad(ceiling[0], ceiling[1], ceiling[2], ceiling[3], Vector3.UP, CONCRETE)
+			# The top is a deck just under the surface: buried under terrain, but where
+			# the terrain beside a cutting is cut away it reads as street level, not as a
+			# roof sunk metres below it.
+			var da := maxf(ca, minf(height_at(l0), height_at(r0)) - DECK_DROP)
+			var db := maxf(cb, minf(height_at(l1), height_at(r1)) - DECK_DROP)
+			_s_quad(Vector3(l0.x, da, l0.y), Vector3(l1.x, db, l1.y), Vector3(r1.x, db, r1.y),
+				Vector3(r0.x, da, r0.y), Vector3.UP, CONCRETE)
+			for s: float in [1.0, -1.0]:
+				var e0 := a + side * s * wall
+				var e1 := b + side * s * wall
+				if da > ca + 0.05 or db > cb + 0.05:
+					_s_quad(Vector3(e0.x, ca, e0.y), Vector3(e1.x, cb, e1.y), Vector3(e1.x, db, e1.y),
+						Vector3(e0.x, da, e0.y), Vector3(side.x * s, 0, side.y * s), CONCRETE)
 		# Headwall where the roof begins or ends (a sunk tunnel's portals are its ends):
 		# from the roof up past the ground.
 		var start_portal := sunk and k == 1 and not _on_border(a)

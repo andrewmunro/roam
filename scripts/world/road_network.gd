@@ -63,7 +63,22 @@ var _ring_of_node := PackedInt32Array()
 var _rings: Array[Dictionary] = []
 var _clusters: Array[Dictionary] = []
 var _seg_grid := {}  # Vector2i -> Array of edge ids
+var _cuttings: Array[Dictionary] = []  # {pts, hw} of roads down in open cuttings
+var _cut_grid := {}  # Vector2i -> Array of _cuttings indices
 var _pt_grid := {}  # Vector2i -> Array of point indices
+
+
+## Adds a road down in an open cutting (drawn elsewhere): no pavement hangs over it.
+func add_cutting(pts: PackedVector2Array, hw: float) -> void:
+	var i := _cuttings.size()
+	_cuttings.append({pts = pts, hw = hw})
+	for k in pts.size() - 1:
+		for c in _cells(pts[k], pts[k + 1], hw + PAVEMENT):
+			if _cut_grid.has(c):
+				if _cut_grid[c].back() != i:
+					_cut_grid[c].append(i)
+			else:
+				_cut_grid[c] = [i]
 
 
 ## Adds a road polyline. `oneway` follows OSM: 1 along the line, -1 against it.
@@ -713,6 +728,18 @@ func _on_other_road(p: Vector2, skip: int) -> bool:
 	return false
 
 
+## True if p is over an open cutting (its carriageway out to the walls).
+func _over_cutting(p: Vector2) -> bool:
+	for i: int in _cut_grid.get(Vector2i(floori(p.x / GRID), floori(p.y / GRID)), []):
+		var cut: Dictionary = _cuttings[i]
+		var pts: PackedVector2Array = cut.pts
+		var lim: float = cut.hw + 1.0
+		for k in pts.size() - 1:
+			if Geometry2D.get_closest_point_to_segment(p, pts[k], pts[k + 1]).distance_squared_to(p) < lim * lim:
+				return true
+	return false
+
+
 ## Overpass points of a kind within `radius` of p.
 func _points_near(p: Vector2, radius: float, kind: int) -> Array[Vector2]:
 	var out: Array[Vector2] = []
@@ -969,7 +996,8 @@ func _kerb(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Ar
 	clear.resize(n)
 	for k in n:
 		if k % 3 == 0 or k == n - 1:
-			clear[k] = not _on_other_road(pts[k] + out[k] * (PAVEMENT * 0.75), skip)
+			clear[k] = not _on_other_road(pts[k] + out[k] * (PAVEMENT * 0.75), skip) \
+				and not _over_cutting(pts[k] + out[k] * (PAVEMENT + 0.5))
 	for k in n:
 		if k % 3 != 0 and k != n - 1:
 			clear[k] = clear[k - k % 3] and clear[mini(k - k % 3 + 3, n - 1)]
