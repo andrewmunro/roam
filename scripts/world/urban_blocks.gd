@@ -24,6 +24,9 @@ var blocks: Array[PackedVector2Array] = []  ## outlines in chunk space, counter-
 var _grid := {}  ## Vector2i -> Array of block indices
 var _segs := {}  ## Vector2i -> Array of road segments [a, b, hw]
 var colors := {}  ## rank -> asphalt colour of roads of that rank
+## Ground between roads that is surfaced like them: block corners taken off by rounding,
+## slivers and scraps too small to be blocks.
+var gaps: Array[PackedVector2Array] = []
 
 
 ## `roads`: [{pts, hw, rank, pave, color}] at grade; `cuttings`: [{pts, hw}].
@@ -66,7 +69,10 @@ func build(p_size: float, roads: Array, cuttings: Array, skip_at: Callable) -> v
 		if touches or poly.size() < 3:
 			continue  # cut off by the edge of the grid: not a whole block
 		var area := MVTDecoder.ring_area(poly)
-		if absf(area) < MIN_AREA or absf(area) > MAX_AREA:
+		if absf(area) > MAX_AREA:
+			continue
+		if absf(area) < MIN_AREA:
+			gaps.append(poly)  # a scrap of ground between roads: surfaced like them
 			continue
 		if area < 0.0:
 			poly.reverse()
@@ -86,7 +92,10 @@ func build(p_size: float, roads: Array, cuttings: Array, skip_at: Callable) -> v
 					rounded = grown[0]
 					break
 		if rounded.is_empty():
-			continue  # too thin to be a block (a sliver between parallel roads)
+			gaps.append(poly)  # too thin to be a block (a sliver between parallel roads)
+			continue
+		# What rounding took off the corners is road surface.
+		gaps.append_array(Geometry2D.clip_polygons(poly, rounded))
 		poly = rounded
 		if MVTDecoder.ring_area(poly) < 0.0:
 			poly.reverse()
@@ -103,6 +112,26 @@ func build(p_size: float, roads: Array, cuttings: Array, skip_at: Callable) -> v
 	if OS.has_environment("ROAM_ROAD_TIMES"):
 		print("blocks ms (stamp, trace, outlines): ", [(t1 - t0) / 1000, (t2 - t1) / 1000,
 			(Time.get_ticks_usec() - t2) / 1000], " outlines ", outlines.size())
+
+
+## Where this tile's roads are surfaced, as an L8 image over the tile at CELL metres a
+## pixel (below 128: road). `extra`: [{pts, hw}] roads that don't bound blocks (service
+## roads), stamped in now that the blocks are traced.
+func road_mask(extra: Array) -> Image:
+	for r: Dictionary in extra:
+		_stamp(r.pts, r.hw, 3)
+	var off := Vector2(MARGIN, MARGIN)
+	for g in gaps:
+		var shifted := PackedVector2Array()
+		for p in g:
+			shifted.append(p + off)
+		Raster.fill_polygon(_owner, _w, _h, CELL, shifted, 4)
+	var n := ceili(size / CELL)
+	var i0 := roundi(MARGIN / CELL)
+	var data := PackedByteArray()
+	for j in range(i0, i0 + n):
+		data.append_array(_owner.slice(j * _w + i0, j * _w + i0 + n))
+	return Image.create_from_data(n, n, false, Image.FORMAT_L8, data)
 
 
 ## True if p is inside a traced block.

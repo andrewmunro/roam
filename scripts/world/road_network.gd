@@ -64,6 +64,10 @@ var _rings: Array[Dictionary] = []
 var _clusters: Array[Dictionary] = []
 var _seg_grid := {}  # Vector2i -> Array of edge ids
 var _blocks: UrbanBlocks = null
+## Roads are surfaced by the terrain shader from `road_mask` instead of as meshes:
+## carriageways, junction and ring surfaces are left out; kerbs, islands and paint stay.
+var mask_mode := false
+var road_mask: Image  ## set by build() in mask_mode (see UrbanBlocks.road_mask)
 var _cuttings: Array[Dictionary] = []  # {pts, hw} of roads down in open cuttings
 var _cut_grid := {}  # Vector2i -> Array of _cuttings indices
 var _pt_grid := {}  # Vector2i -> Array of point indices
@@ -115,7 +119,7 @@ func build() -> void:
 		_ring_cuts(r)
 	for c in _clusters:
 		_cluster_cuts(c)
-	if not OS.has_environment("ROAM_NO_BLOCKS"):
+	if mask_mode or not OS.has_environment("ROAM_NO_BLOCKS"):
 		_build_blocks()
 	tm.append(Time.get_ticks_usec())
 	for r in _rings:
@@ -128,6 +132,12 @@ func build() -> void:
 	for e in _edges:
 		if e.own and not e.phantom and e.ring < 0:
 			_emit_edge(e)
+	if mask_mode:
+		var service: Array[Dictionary] = []
+		for e in _edges:
+			if not e.phantom and e.rank < 4:
+				service.append({pts = e.pts, hw = e.hw})
+		road_mask = _blocks.road_mask(service)
 	tm.append(Time.get_ticks_usec())
 	var out := []
 	var last := t0
@@ -142,7 +152,11 @@ func _owned(p: Vector2) -> bool:
 	return p.x >= 0.0 and p.y >= 0.0 and p.x < size and p.y < size
 
 
-static func _lift(rank: int) -> float:
+## Height of a road surface above the terrain. With the road mask the terrain is the
+## surface, so kerbs and paint sit just on it.
+func _lift(rank: int) -> float:
+	if mask_mode:
+		return 0.02
 	return 0.12 + rank * 0.025
 
 
@@ -949,12 +963,14 @@ func _emit_edge(e: Dictionary) -> void:
 		var p := _point_at(pts, dist, ss[k])
 		var n := Vector2(-tans[k].y, tans[k].x)
 		var h := _ribbon_h(p, n, hw, lift)
-		var v := (ss[k] - c0) * scale
-		_vert(Vector3(p.x + n.x * hw, h, p.y + n.y * hw), Vector2(0, v), uv2, color)
-		_vert(Vector3(p.x - n.x * hw, h, p.y - n.y * hw), Vector2(1, v), uv2, color)
 		left.append(p + n * hw)
 		right.append(p - n * hw)
 		hs.append(h)
+		if mask_mode:
+			continue  # the terrain is the road surface (see road_mask)
+		var v := (ss[k] - c0) * scale
+		_vert(Vector3(p.x + n.x * hw, h, p.y + n.y * hw), Vector2(0, v), uv2, color)
+		_vert(Vector3(p.x - n.x * hw, h, p.y - n.y * hw), Vector2(1, v), uv2, color)
 		if k > 0:
 			var a := base + (k - 1) * 2
 			indices.append_array([a, a + 1, a + 2, a + 1, a + 3, a + 2])
@@ -1100,7 +1116,8 @@ func _block_kerb(poly: PackedVector2Array) -> void:
 		paved.append(road != UrbanBlocks.FREE and road & UrbanBlocks.UNPAVED == 0)
 		ranks.append(rank)
 		hs.append(maxf(height_at.call(pts[k]), height_at.call(pts[k] - inward * 2.5)) + _lift(rank))
-	_apron(pts, hs, out, ranks, paved)
+	if not mask_mode:
+		_apron(pts, hs, out, ranks, paved)
 	# Start at an unpaved point so no run wraps past the end; all paved: close the ring.
 	var start := paved.find(false)
 	if start < 0:
@@ -1212,7 +1229,8 @@ func _emit_cluster(c: Dictionary) -> void:
 		kerb_h.append(mb.h)
 		if arms[i].pave and arms[j].pave and (n > 2 or not curve.is_empty()):
 			_fillet_kerb(kerb_pts, kerb_h)
-	_fill(poly, hs, color, c.centre)
+	if not mask_mode:
+		_fill(poly, hs, color, c.centre)
 	stats.junctions += 1
 	_emit_controls(c, arms)
 
@@ -1462,7 +1480,7 @@ func _emit_ring(r: Dictionary) -> void:
 		ring_h.append(h)
 		_vert(Vector3(pi_.x, h, pi_.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
 		_vert(Vector3(po.x, h, po.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
-	for k in seg:
+	for k in (seg if not mask_mode else 0):
 		var a := base + k * 2
 		var b := base + ((k + 1) % seg) * 2
 		_quad(a, a + 1, b + 1, b)
@@ -1552,7 +1570,8 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 			for p in curve:
 				poly.append(p)
 				hs.append(height_at.call(p) + lift)
-	_fill(poly, hs, arm.color, (m.p as Vector2).lerp(centre, 0.3))
+	if not mask_mode:
+		_fill(poly, hs, arm.color, (m.p as Vector2).lerp(centre, 0.3))
 	var app := _approach(arm)
 	if app != Vector2.ZERO and not arm.phantom:
 		_across(arm, maxf(arm.s_exit + 0.3, 0.5), app.x, app.y, 0.25, 0.6, 0.3)

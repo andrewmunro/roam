@@ -118,7 +118,7 @@ const TERRAIN_LAYER := 2  ## physics layer bit for terrain (cars ignore it insid
 
 ## The shared terrain material, or a copy that cuts holes where tunnels meet the surface.
 func _terrain_material_for(b: ChunkBuilder) -> ShaderMaterial:
-	if b.mouth_boxes.is_empty() and b.cut_mask == null:
+	if b.mouth_boxes.is_empty() and b.cut_mask == null and b.road_mask == null:
 		return terrain_material
 	var m: ShaderMaterial = terrain_material.duplicate()
 	var inv: Array[Projection] = []
@@ -131,6 +131,10 @@ func _terrain_material_for(b: ChunkBuilder) -> ShaderMaterial:
 		m.set_shader_parameter("cut_mask", ImageTexture.create_from_image(b.cut_mask))
 		m.set_shader_parameter("cut_size", b.size)
 		m.set_shader_parameter("cut_base", b.cut_base)
+	if b.road_mask != null:
+		m.set_shader_parameter("has_roads", true)
+		m.set_shader_parameter("road_mask", ImageTexture.create_from_image(b.road_mask))
+		m.set_shader_parameter("road_size", b.road_mask.get_width() * UrbanBlocks.CELL)
 	return m
 
 

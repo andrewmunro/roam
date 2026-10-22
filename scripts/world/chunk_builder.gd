@@ -176,6 +176,9 @@ var mouth_boxes: Array[Transform3D] = []
 ## R = signed distance (m) to the cutting's edge (negative inside), G = floor height
 ## above cut_base. The terrain shader discards terrain inside that is above the floor.
 var cut_mask: Image
+## Where roads are surfaced (L8 over the tile, below 128: road), when the terrain
+## shader draws them (ROAM_ROAD_MASK); null otherwise. See UrbanBlocks.road_mask.
+var road_mask: Image
 var cut_base := 0.0
 const CUT_MASK_RES := 256
 var _open_segments: Array[Dictionary] = []  # {a, b, ha, hb, wall, skip_l, skip_r}
@@ -1520,6 +1523,7 @@ func _build_network() -> RoadNetwork:
 	net.height_at = height_at
 	net.built_up_at = built_up_at
 	net.have_points = _osm_complete
+	net.mask_mode = OS.has_environment("ROAM_ROAD_MASK")
 	for i in range(0, _osm_points.size() - 2, 3):
 		var p := Vector2((_osm_points[i] - _merc0[0]) * _scale, (_merc0[1] - _osm_points[i + 1]) * _scale)
 		if p.x > -RoadNetwork.MARGIN and p.y > -RoadNetwork.MARGIN and p.x < size + RoadNetwork.MARGIN 				and p.y < size + RoadNetwork.MARGIN:
@@ -1543,8 +1547,20 @@ func _build_network() -> RoadNetwork:
 	return net
 
 
+## True if the terrain surfaces a road at p (ROAM_ROAD_MASK): paths crossing a road
+## stop at its edge instead of lying on top.
+func _on_mask_road(p: Vector2) -> bool:
+	if road_mask == null:
+		return false
+	var n := road_mask.get_width()
+	var i := floori(p.x / UrbanBlocks.CELL)
+	var j := floori(p.y / UrbanBlocks.CELL)
+	return i >= 0 and j >= 0 and i < n and j < n and road_mask.get_pixel(i, j).r < 0.5
+
+
 func _build_roads() -> void:
 	var net := _build_network()
+	road_mask = net.road_mask
 	var verts := net.verts
 	var uvs := net.uvs
 	var uv2s := net.uv2s
@@ -1641,7 +1657,7 @@ func _build_roads() -> void:
 			uvs.append_array([Vector2(0, along), Vector2(1, along)])
 			uv2s.append_array([uv2, uv2])
 			colors.append_array([color, color])
-			if k > 0:
+			if k > 0 and (structure or not (_on_mask_road(pts[k - 1]) and _on_mask_road(pts[k]))):
 				var a := base + (k - 1) * 2
 				indices.append_array([a, a + 1, a + 2, a + 1, a + 3, a + 2])
 				if structure:
