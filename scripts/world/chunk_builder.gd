@@ -1521,6 +1521,9 @@ func _build_network() -> RoadNetwork:
 	net.north_america = region == RegionStyle.NORTH_AMERICA
 	net.uk = region == RegionStyle.UK
 	net.height_at = height_at
+	net.terrain = _h
+	net.terrain_n = _n
+	net.terrain_cell = _cell
 	net.built_up_at = built_up_at
 	net.have_points = _osm_complete
 	net.mask_mode = RoadNetwork.use_mask
@@ -1604,27 +1607,19 @@ func _build_roads() -> void:
 			pts.insert(0, pts[0] - first_dir * hw * 0.8)
 		if not structure and not networked and not _on_border(pts[pts.size() - 1]):
 			pts.append(pts[pts.size() - 1] + last_dir * hw * 0.8)
-		var lift := 0.12 + rank * 0.025
+		var lift := RoadNetwork.lift(rank)
 		var heights := PackedFloat32Array()
 		heights.resize(pts.size())
-		if road.bridge:
-			# Never let the deck dip below the (final) terrain, e.g. near its ends.
+		if structure:
 			for k in pts.size():
-				heights[k] = maxf(road.heights[k], height_at(pts[k])) + lift
-			_build_bridge(pts, heights, hw, road_idx, rank >= DRIVABLE_RANK)
-		elif road.tunnel:
-			# Near the portals the final terrain can sit below the raw DEM (carving,
-			# flattening); never let the tunnel float above it.
-			# The profile comes from the raw DEM; where it is shallow, blend into the final
-			# (flattened) terrain so cuttings meet the street level without a step.
-			for k in pts.size():
-				var ground := height_at(pts[k])
-				var w := clampf((ground - road.heights[k]) / 3.0, 0.0, 1.0)
-				heights[k] = lerpf(ground, road.heights[k], w) + lift
-			_build_tunnel(pts, heights, hw, road.get("open", false), road.get("sunk", false))
+				heights[k] = _structure_h(net, road, k, pts[k])
+			if road.bridge:
+				_build_bridge(pts, heights, hw, road_idx, rank >= DRIVABLE_RANK)
+			else:
+				_build_tunnel(pts, heights, hw, road.get("open", false), road.get("sunk", false))
 		elif networked:
 			for k in pts.size():  # only for spawns and props: the network draws these
-				heights[k] = height_at(pts[k]) + lift
+				heights[k] = net.surface_at(pts[k], rank)
 		else:
 			# Sit on the highest of centre and both edges so terrain can't poke through.
 			for k in pts.size():
@@ -1651,8 +1646,13 @@ func _build_roads() -> void:
 			spawn_pts.append(Vector3(pts[k].x, y, pts[k].y))
 			if networked:
 				continue
-			var l := Vector3(pts[k].x + nrm.x, y, pts[k].y + nrm.y)
-			var r := Vector3(pts[k].x - nrm.x, y, pts[k].y - nrm.y)
+			var yl := y
+			var yr := y
+			if structure:  # each edge meets the street's own edge (see _structure_h)
+				yl = _structure_h(net, road, k, pts[k] + nrm)
+				yr = _structure_h(net, road, k, pts[k] - nrm)
+			var l := Vector3(pts[k].x + nrm.x, yl, pts[k].y + nrm.y)
+			var r := Vector3(pts[k].x - nrm.x, yr, pts[k].y - nrm.y)
 			verts.append_array([l, r])
 			uvs.append_array([Vector2(0, along), Vector2(1, along)])
 			uv2s.append_array([uv2, uv2])
@@ -1684,6 +1684,19 @@ func _build_roads() -> void:
 
 
 # --- Structure geometry ----------------------------------------------------------------
+
+## Road surface height of a bridge or tunnel at its k-th point, taken at p (the centre
+## line or one edge). Where the structure comes down (or up) to street level it eases
+## into the shared street surface (RoadNetwork.surface_at), so its ends meet the
+## streets, junctions and ramps there exactly instead of with a step. A deck never dips
+## below the street surface, nor a tunnel rises above it.
+func _structure_h(net: RoadNetwork, road: Dictionary, k: int, p: Vector2) -> float:
+	var rank: int = ROADS[road.cls][1]
+	var street := net.surface_at(p, rank)
+	var h: float = road.heights[k] + RoadNetwork.lift(rank)
+	h = maxf(h, street) if road.bridge else minf(h, street)
+	return lerpf(street, h, smoothstep(0.5, 2.5, absf(h - street)))
+
 
 const CONCRETE := Color(0.62, 0.61, 0.58, 0.0)  # alpha 0: no windows in the building shader
 const TUNNEL_WALL := Color(0.55, 0.53, 0.47, 0.0)

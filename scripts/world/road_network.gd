@@ -15,6 +15,7 @@ const T_SNAP := 1.5  ## a dangling end this close to another road joins it there
 const MARGIN := 150.0  ## how far into the neighbouring tiles the graph reaches
 const DASH := 12.0  ## centre line period; each edge fits a whole number of them
 const KERB := 0.12
+const SURFACE_REACH := 2.0
 const PAVEMENT := 2.0
 const PAINT := Color(0.88, 0.88, 0.84)
 const YELLOW := Color(0.86, 0.68, 0.16)
@@ -35,6 +36,11 @@ var left_hand := false
 var north_america := false
 var uk := false
 var height_at: Callable  ## (Vector2) -> float, final terrain height
+## The same terrain as a grid (row-major, terrain_n squared vertices terrain_cell apart),
+## for surface_at; height_at is used when it is left empty.
+var terrain := PackedFloat32Array()
+var terrain_n := 0
+var terrain_cell := 1.0
 var built_up_at: Callable  ## (Vector2) -> bool, urban land use or buildings nearby
 ## Overpass nodes near the tile: {pos: Vector2, kind: Pt}.
 var points: Array[Dictionary] = []
@@ -155,12 +161,51 @@ func _owned(p: Vector2) -> bool:
 	return p.x >= 0.0 and p.y >= 0.0 and p.x < size and p.y < size
 
 
-## Height of a road surface above the terrain. With the road mask the terrain is the
-## surface, so kerbs and paint sit just on it.
+## Height of a road surface above the terrain: bigger roads a little higher, so where
+## two overlap the bigger one shows. With the road mask the terrain is the surface, so
+## kerbs and paint sit just on it.
 func _lift(rank: int) -> float:
-	if mask_mode:
-		return 0.02
+	return 0.02 if mask_mode else lift(rank)
+
+
+static func lift(rank: int) -> float:
 	return 0.12 + rank * 0.025
+
+
+## The road surface height at p, shared by every at-grade piece (carriageways, junction
+## and ring surfaces, kerbs, paint, props) and the ends of bridges and tunnels: anything
+## of a rank built at the same point gets the same height, so pieces meet without steps.
+## It depends on p and rank alone and clears the terrain within SURFACE_REACH of p.
+func surface_at(p: Vector2, rank: int) -> float:
+	if terrain_n == 0:  # no grid given (tests): sample through height_at
+		var g: float = height_at.call(p)
+		for d in [Vector2(SURFACE_REACH, 0), Vector2(-SURFACE_REACH, 0), Vector2(0, SURFACE_REACH),
+				Vector2(0, -SURFACE_REACH)]:
+			g = maxf(g, height_at.call(p + d))
+		return g + _lift(rank)
+	var h := _terrain(p.x, p.y)
+	h = maxf(h, _terrain(p.x + SURFACE_REACH, p.y))
+	h = maxf(h, _terrain(p.x - SURFACE_REACH, p.y))
+	h = maxf(h, _terrain(p.x, p.y + SURFACE_REACH))
+	h = maxf(h, _terrain(p.x, p.y - SURFACE_REACH))
+	return h + _lift(rank)
+
+
+## height_at, read straight off the terrain grid (it is called a lot).
+func _terrain(x: float, z: float) -> float:
+	var fx := clampf(x / terrain_cell, 0.0, terrain_n - 1.001)
+	var fz := clampf(z / terrain_cell, 0.0, terrain_n - 1.001)
+	var i := floori(fx)
+	var j := floori(fz)
+	var u := fx - i
+	var v := fz - j
+	var h00 := terrain[j * terrain_n + i]
+	var h11 := terrain[(j + 1) * terrain_n + i + 1]
+	if u >= v:
+		var h10 := terrain[j * terrain_n + i + 1]
+		return h00 + u * (h10 - h00) + v * (h11 - h10)
+	var h01 := terrain[(j + 1) * terrain_n + i]
+	return h00 + v * (h01 - h00) + u * (h11 - h01)
 
 
 # --- Graph ----------------------------------------------------------------------------
@@ -776,10 +821,6 @@ func _points_near(p: Vector2, radius: float, kind: int) -> Array[Vector2]:
 
 # --- Mesh helpers -----------------------------------------------------------------------
 
-func _ribbon_h(p: Vector2, n: Vector2, hw: float, lift: float) -> float:
-	return maxf(height_at.call(p), maxf(height_at.call(p + n * hw), height_at.call(p - n * hw))) + lift
-
-
 func _vert(p: Vector3, uv: Vector2, uv2: Vector2, color: Color) -> int:
 	verts.append(p)
 	uvs.append(uv)
@@ -822,11 +863,11 @@ func _fill(poly: PackedVector2Array, hs: PackedFloat32Array, color: Color, centr
 		_tri(base + tris[t], base + tris[t + 1], base + tris[t + 2])
 
 
-## Paint quad (corners in order), lying at height h.
-func _paint(corners: Array[Vector2], h: float, color := PAINT) -> void:
+## Paint quad (corners in order), lying on the road surface.
+func _paint(corners: Array[Vector2], rank: int, color := PAINT) -> void:
 	var base := verts.size()
 	for c in corners:
-		_vert(Vector3(c.x, h + 0.02, c.y), Vector2.ZERO, Vector2(0.0, STYLE_PAINT), color)
+		_vert(Vector3(c.x, surface_at(c, rank) + 0.02, c.y), Vector2.ZERO, Vector2(0.0, STYLE_PAINT), color)
 	_quad(base, base + 1, base + 2, base + 3)
 
 
@@ -838,15 +879,14 @@ func _across(arm: Dictionary, s: float, x0: float, x1: float, width: float, dash
 	var p: Vector2 = f[0]
 	var t: Vector2 = f[1]
 	var n := Vector2(-t.y, t.x)
-	var h := _ribbon_h(p, n, arm.hw, _lift(arm.rank))
 	var half := t * width * 0.5
 	if dash <= 0.0:
-		_paint([p + n * x0 - half, p + n * x1 - half, p + n * x1 + half, p + n * x0 + half], h, color)
+		_paint([p + n * x0 - half, p + n * x1 - half, p + n * x1 + half, p + n * x0 + half], arm.rank, color)
 		return
 	var x := x0
 	while x < x1 - 0.05:
 		var xe := minf(x + dash, x1)
-		_paint([p + n * x - half, p + n * xe - half, p + n * xe + half, p + n * x + half], h, color)
+		_paint([p + n * x - half, p + n * xe - half, p + n * xe + half, p + n * x + half], arm.rank, color)
 		x = xe + gap
 
 
@@ -871,8 +911,7 @@ func _kerb_prop(arm: Dictionary, s: float, out := 0.6) -> Transform3D:
 	var n := Vector2(-t.y, t.x)
 	var side := 1.0 if left_hand else -1.0  # inbound drivers' near side
 	var q: Vector2 = p + n * side * (arm.hw + out)
-	var y := _ribbon_h(p, n, arm.hw, _lift(arm.rank))
-	y = y + KERB if arm.pave else height_at.call(q)
+	var y: float = surface_at(p + n * side * arm.hw, arm.rank) + KERB if arm.pave else height_at.call(q)
 	var z := Vector3(t.x, 0.0, t.y)
 	return Transform3D(Basis(Vector3.UP.cross(z), Vector3.UP, z), Vector3(q.x, y, q.y))
 
@@ -948,7 +987,6 @@ func _emit_edge(e: Dictionary) -> void:
 	ss.append(length - c1)
 	tans.append(_node_tangent(e, 1, eid) if c1 < 0.01 else -(_frame(e, 1, c1)[1] as Vector2))
 	var hw: float = e.hw
-	var lift := _lift(e.rank)
 	var visible := length - c0 - c1
 	var periods := roundf(visible / DASH)
 	var style := _style(e)
@@ -961,19 +999,20 @@ func _emit_edge(e: Dictionary) -> void:
 	var base := verts.size()
 	var left := PackedVector2Array()
 	var right := PackedVector2Array()
-	var hs := PackedFloat32Array()
+	var hl := PackedFloat32Array()
+	var hr := PackedFloat32Array()
 	for k in ss.size():
 		var p := _point_at(pts, dist, ss[k])
 		var n := Vector2(-tans[k].y, tans[k].x)
-		var h := _ribbon_h(p, n, hw, lift)
 		left.append(p + n * hw)
 		right.append(p - n * hw)
-		hs.append(h)
+		hl.append(surface_at(left[k], e.rank))
+		hr.append(surface_at(right[k], e.rank))
 		if mask_mode:
 			continue  # the terrain is the road surface (see road_mask)
 		var v := (ss[k] - c0) * scale
-		_vert(Vector3(p.x + n.x * hw, h, p.y + n.y * hw), Vector2(0, v), uv2, color)
-		_vert(Vector3(p.x - n.x * hw, h, p.y - n.y * hw), Vector2(1, v), uv2, color)
+		_vert(Vector3(left[k].x, hl[k], left[k].y), Vector2(0, v), uv2, color)
+		_vert(Vector3(right[k].x, hr[k], right[k].y), Vector2(1, v), uv2, color)
 		if k > 0:
 			var a := base + (k - 1) * 2
 			indices.append_array([a, a + 1, a + 2, a + 1, a + 3, a + 2])
@@ -984,8 +1023,8 @@ func _emit_edge(e: Dictionary) -> void:
 		for k in ss.size():
 			nl.append((left[k] - right[k]).normalized())
 			nr.append((right[k] - left[k]).normalized())
-		_kerb(left, hs, nl, eid)
-		_kerb(right, hs, nr, eid)
+		_kerb(left, hl, nl, eid)
+		_kerb(right, hr, nr, eid)
 
 
 static func _point_at(pts: PackedVector2Array, dist: PackedFloat32Array, d: float) -> Vector2:
@@ -1118,7 +1157,7 @@ func _block_kerb(poly: PackedVector2Array) -> void:
 		var rank := 4 if road == UrbanBlocks.FREE else road & 31
 		paved.append(road != UrbanBlocks.FREE and road & UrbanBlocks.UNPAVED == 0)
 		ranks.append(rank)
-		hs.append(maxf(height_at.call(pts[k]), height_at.call(pts[k] - inward * 2.5)) + _lift(rank))
+		hs.append(surface_at(pts[k], rank))
 	if not mask_mode:
 		_apron(pts, hs, out, ranks, paved)
 	# Start at an unpaved point so no run wraps past the end; all paved: close the ring.
@@ -1163,7 +1202,7 @@ func _apron(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2A
 		var color: Color = _blocks.colors.get(ranks[k], Color(0.47, 0.47, 0.48))
 		var q := pts[k] - out[k] * APRON
 		_vert(Vector3(pts[k].x, hs[k] - 0.04, pts[k].y), Vector2(0.5, 0.0), Vector2.ZERO, color)
-		_vert(Vector3(q.x, hs[k] - 0.04, q.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		_vert(Vector3(q.x, surface_at(q, ranks[k]) - 0.04, q.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
 	for k in n:
 		var a := base + k * 2
 		var b := base + ((k + 1) % n) * 2
@@ -1178,7 +1217,9 @@ func _mouth(arm: Dictionary) -> Dictionary:
 	var t: Vector2 = arm.mouth[1]
 	var n := Vector2(-t.y, t.x)
 	var hw: float = arm.hw
-	return {p = p, t = t, l = p + n * hw, r = p - n * hw, h = _ribbon_h(p, n, hw, _lift(arm.rank))}
+	var l := p + n * hw
+	var r := p - n * hw
+	return {p = p, t = t, l = l, r = r, hl = surface_at(l, arm.rank), hr = surface_at(r, arm.rank)}
 
 
 ## Quadratic curve from a to b whose tangents run back along ta / tb (outward arm
@@ -1210,7 +1251,6 @@ func _emit_cluster(c: Dictionary) -> void:
 		if arm.rank > top_rank:
 			top_rank = arm.rank
 			color = arm.color
-	var lift := _lift(top_rank)
 	var poly := PackedVector2Array()
 	var hs := PackedFloat32Array()
 	for i in n:
@@ -1218,18 +1258,18 @@ func _emit_cluster(c: Dictionary) -> void:
 		var ma := mouths[i]
 		var mb := mouths[j]
 		poly.append_array([ma.r, ma.l])
-		hs.append_array([ma.h, ma.h])
+		hs.append_array([ma.hr, ma.hl])
 		var curve := _fillet(ma.l, ma.t, mb.r, mb.t, 6)
 		var kerb_pts := PackedVector2Array([ma.l])
-		var kerb_h := PackedFloat32Array([ma.h])
+		var kerb_h := PackedFloat32Array([ma.hl])
 		for p in curve:
-			var h: float = height_at.call(p) + lift
+			var h := surface_at(p, maxi(arms[i].rank, arms[j].rank))
 			poly.append(p)
 			hs.append(h)
 			kerb_pts.append(p)
 			kerb_h.append(h)
 		kerb_pts.append(mb.r)
-		kerb_h.append(mb.h)
+		kerb_h.append(mb.hr)
 		if arms[i].pave and arms[j].pave and (n > 2 or not curve.is_empty()):
 			_fillet_kerb(kerb_pts, kerb_h)
 	if not mask_mode:
@@ -1316,7 +1356,7 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 		_centre_through(arms[major.x], arms[major.y])
 	if ctl == Ctl.MINI:
 		stats.mini += 1
-		_disc(c.centre, 1.6, height_at.call(c.centre) + _lift(major_rank), PAINT, true)
+		_disc(c.centre, 1.6, surface_at(c.centre, major_rank), PAINT, true)
 	for i in arms.size():
 		var arm := arms[i]
 		var app := _approach(arm)
@@ -1385,7 +1425,6 @@ func _centre_through(a: Dictionary, b: Dictionary) -> void:
 	var total := dist[dist.size() - 1]
 	var n := maxf(roundf(total / 6.0), 1.0)
 	var period := total / n
-	var h := maxf(ma.h, mb.h)
 	for i in int(n):
 		var s0 := i * period + period * 0.17
 		var s1 := s0 + period * 0.66
@@ -1393,7 +1432,7 @@ func _centre_through(a: Dictionary, b: Dictionary) -> void:
 		var p1 := _point_at(pts, dist, s1)
 		var d := (p1 - p0).normalized()
 		var w := Vector2(-d.y, d.x) * 0.07
-		_paint([p0 - w, p1 - w, p1 + w, p0 + w], h)
+		_paint([p0 - w, p1 - w, p1 + w, p0 + w], maxi(a.rank, b.rank))
 
 
 func _stop(arm: Dictionary, app: Vector2, room: float) -> void:
@@ -1425,12 +1464,11 @@ func _crossing(arm: Dictionary, s: float) -> void:
 	var p: Vector2 = f[0]
 	var t: Vector2 = f[1]
 	var n := Vector2(-t.y, t.x)
-	var h := _ribbon_h(p, n, arm.hw, _lift(arm.rank))
 	var x := -w + 0.3
 	while x < w - 0.3:
 		var a := p + n * x
 		var b := p + n * minf(x + 0.5, w)
-		_paint([a - t * 1.5, b - t * 1.5, b + t * 1.5, a + t * 1.5], h)
+		_paint([a - t * 1.5, b - t * 1.5, b + t * 1.5, a + t * 1.5], arm.rank)
 		x += 1.1
 
 
@@ -1440,12 +1478,11 @@ func _triangle(arm: Dictionary, s: float, x: float) -> void:
 	var p: Vector2 = f[0]
 	var t: Vector2 = f[1]
 	var n := Vector2(-t.y, t.x)
-	var h := _ribbon_h(p, n, arm.hw, _lift(arm.rank))
 	# Base towards the junction, point towards approaching drivers.
 	var c := p + n * x
 	var apex := c + t * 2.0
 	var base_c := c - t * 2.0
-	_paint([apex, apex, base_c + n * 0.6, base_c - n * 0.6], h)
+	_paint([apex, apex, base_c + n * 0.6, base_c - n * 0.6], arm.rank)
 
 
 ## Flat disc; raised gives it a low dome like a mini-roundabout.
@@ -1468,7 +1505,6 @@ func _emit_ring(r: Dictionary) -> void:
 	var radius: float = r.r
 	var outer: float = radius + r.hw
 	var inner: float = radius - r.hw
-	var lift := _lift(r.rank)
 	var color: Color = r.color
 	var seg := clampi(int(radius * 1.2), 20, 64)
 	stats.roundabouts += 1
@@ -1479,10 +1515,10 @@ func _emit_ring(r: Dictionary) -> void:
 		var d := Vector2.from_angle(k * TAU / seg)
 		var po := centre + d * outer
 		var pi_ := centre + d * maxf(inner, 0.5)
-		var h := maxf(height_at.call(po), height_at.call(pi_)) + lift
+		var h := surface_at(pi_, r.rank)
 		ring_h.append(h)
 		_vert(Vector3(pi_.x, h, pi_.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
-		_vert(Vector3(po.x, h, po.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
+		_vert(Vector3(po.x, surface_at(po, r.rank), po.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
 	for k in (seg if not mask_mode else 0):
 		var a := base + k * 2
 		var b := base + ((k + 1) % seg) * 2
@@ -1495,14 +1531,13 @@ func _emit_ring(r: Dictionary) -> void:
 			var a1 := (k + 0.7) * TAU / dashes
 			var d0 := Vector2.from_angle(a0)
 			var d1 := Vector2.from_angle(a1)
-			var h := ring_h[int(a0 / TAU * seg) % seg]
 			_paint([centre + d0 * (radius - 0.07), centre + d1 * (radius - 0.07),
-				centre + d1 * (radius + 0.07), centre + d0 * (radius + 0.07)], h)
+				centre + d1 * (radius + 0.07), centre + d0 * (radius + 0.07)], r.rank)
 	# Entries and exits flare into the ring.
 	for arm: Dictionary in r.arms:
 		_ring_mouth(r, arm)
 	# Central island: kerbed and grassed, or just painted when tiny.
-	var hc: float = height_at.call(centre) + lift
+	var hc := surface_at(centre, r.rank)
 	if inner < 2.5:
 		_disc(centre, maxf(inner, 1.2), hc, PAINT, true)
 		stats.mini += 1
@@ -1535,9 +1570,8 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 	var centre: Vector2 = r.centre
 	var outer: float = r.r + r.hw
 	var m := _mouth(arm)
-	var lift := _lift(maxi(r.rank, arm.rank))
 	var poly := PackedVector2Array([m.r, m.l])
-	var hs := PackedFloat32Array([m.h, m.h])
+	var hs := PackedFloat32Array([m.hr, m.hl])
 	var flare := clampf(arm.hw * 0.8 + 1.5, 2.5, 6.0)
 	var ends: Array[Vector2] = []
 	for side: float in [1.0, -1.0]:
@@ -1560,7 +1594,7 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 		if side > 0.0:
 			for p in curve:
 				poly.append(p)
-				hs.append(height_at.call(p) + lift)
+				hs.append(surface_at(p, arm.rank))
 		else:
 			# Close the polygon along the ring, inside its outer edge.
 			var a0 := (ends[0] - centre).angle()
@@ -1569,10 +1603,10 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 			for k in range(1, 6):
 				var p := centre + Vector2.from_angle(a0 + span * k / 6.0) * (outer - 0.6)
 				poly.append(p)
-				hs.append(height_at.call(p) + lift)
+				hs.append(surface_at(p, r.rank) - 0.03)  # under the ring's own surface
 			for p in curve:
 				poly.append(p)
-				hs.append(height_at.call(p) + lift)
+				hs.append(surface_at(p, arm.rank))
 	if not mask_mode:
 		_fill(poly, hs, arm.color, (m.p as Vector2).lerp(centre, 0.3))
 	var app := _approach(arm)
