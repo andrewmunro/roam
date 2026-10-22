@@ -61,6 +61,7 @@ var _results: VBoxContainer
 var _search_msg: Label
 var _result_coords: Array[Vector2] = []
 var _result_names: Array[String] = []
+var _results_query := ""  # the (stripped) query whose results are listed; "" when none
 var _selected := -1
 var _last_search_msec := -10000
 var _pending_query := ""
@@ -202,6 +203,7 @@ func _build_search() -> void:
 	_search.placeholder_text = "Search a place or enter lat, lon"
 	_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_search.text_submitted.connect(_on_submit)
+	_search.text_changed.connect(_on_search_edited)
 	_search.gui_input.connect(_on_search_key)
 	for state: String in ["normal", "focus", "read_only"]:
 		_search.add_theme_stylebox_override(state, StyleBoxEmpty.new())
@@ -782,6 +784,9 @@ func _open_search() -> void:
 	_search_panel.visible = true
 	_search_btn.visible = false
 	_menu_btn.visible = false
+	if _results_query != _search.text.strip_edges():
+		_clear_results()
+		_show_message("")
 	_search_panel.reset_size()
 	_search.grab_focus()
 	_search.select_all()
@@ -810,8 +815,16 @@ func _on_search_key(event: InputEvent) -> void:
 			_search.accept_event()
 
 
+## Editing the query drops the old results, the selection and any pending search.
+func _on_search_edited(_text: String) -> void:
+	_pending_query = ""
+	_clear_results()
+	_show_message("")
+
+
 func _on_submit(text: String) -> void:
-	if _selected >= 0 and _selected < _result_coords.size() and text == _search.text \
+	# Enter picks the highlighted result only if the results belong to the text in the field.
+	if _selected >= 0 and _selected < _result_coords.size() and _results_query == text.strip_edges() \
 			and _result_names.size() > _selected and not _results.get_children().is_empty():
 		_pick(_selected)
 		return
@@ -842,7 +855,10 @@ func _search_now(text: String) -> void:
 
 
 func _on_search_result(ok: bool, body: PackedByteArray, query: String) -> void:
+	if query != _search.text.strip_edges():
+		return  # the query was edited while this request was in flight
 	_clear_results()
+	_results_query = query
 	var data: Variant = JSON.parse_string(body.get_string_from_utf8()) if ok else null
 	if not ok or not data is Array:
 		_show_message("Can't reach search right now. Check your connection and try again.")
@@ -907,6 +923,7 @@ func _clear_results() -> void:
 	_styled = _styled.filter(func(s: Array) -> bool: return is_instance_valid(s[0]) and s[0].is_inside_tree())
 	_result_coords.clear()
 	_result_names.clear()
+	_results_query = ""
 	_selected = -1
 
 

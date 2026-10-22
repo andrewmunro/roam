@@ -446,6 +446,17 @@ func _classify() -> void:
 				if _real_end(p) and not _joins_deep(p, ch, chains):
 					portals.append({pos = p, chain = i})
 	_trace_cuttings(context, portals)
+	# Ramps that leave or join another bridge in mid-air start at that deck's height,
+	# not on the ground below it. Two passes let pins propagate along a chain of ramps.
+	for pass_i in 2:
+		for ch in chains:
+			if ch.kind != "bridge":
+				continue
+			var r: PackedVector2Array = ch.pts
+			var pins := Vector2(NAN, NAN)
+			if pass_i > 0:
+				pins = Vector2(_deck_height_at(r[0], ch, chains), _deck_height_at(r[r.size() - 1], ch, chains))
+			ch.profile = _structure_profile(r, "bridge", ch.layer, false, pins)
 	for ch in chains:
 		var r: PackedVector2Array = ch.pts
 		var c: String = ch.cls
@@ -458,7 +469,8 @@ func _classify() -> void:
 			if ROADS[c][1] >= DRIVABLE_RANK:
 				add_road.call(_clip_to_tile_polyline(r), c)  # underpass or passage: a road at grade
 			continue  # (underground footpaths: nothing to draw)
-		for run: Dictionary in _clip_profile(_structure_profile(r, kind, ch.layer, ch.sunk)):
+		var profile: Dictionary = ch.profile if ch.has("profile") else _structure_profile(r, kind, ch.layer, ch.sunk)
+		for run: Dictionary in _clip_profile(profile):
 			if run.pts.size() >= 2:
 				_road_lines.append({pts = run.pts, heights = run.heights, cls = c,
 					bridge = kind == "bridge", tunnel = kind == "tunnel", sunk = ch.sunk})
@@ -830,9 +842,36 @@ static func _polyline_length(pts: PackedVector2Array) -> float:
 	return total
 
 
+## Height of another bridge's deck under a ramp end at p (NAN if none meets it there).
+func _deck_height_at(p: Vector2, self_chain: Dictionary, chains: Array[Dictionary]) -> float:
+	if not _real_end(p):
+		return NAN
+	var best := DECK_JOIN
+	var h := NAN
+	for ch in chains:
+		if is_same(ch, self_chain) or ch.kind != "bridge" or not ch.has("profile"):
+			continue
+		var pts: PackedVector2Array = ch.profile.pts
+		var hs: PackedFloat32Array = ch.profile.heights
+		for k in range(1, pts.size()):
+			var q := Geometry2D.get_closest_point_to_segment(p, pts[k - 1], pts[k])
+			var d := q.distance_to(p)
+			if d < best:
+				best = d
+				var seg := pts[k - 1].distance_to(pts[k])
+				var t := pts[k - 1].distance_to(q) / seg if seg > 0.001 else 0.0
+				h = lerpf(hs[k - 1], hs[k], t)
+	return h
+
+
+const DECK_JOIN := 3.0  ## a ramp end this close to another deck joins it
+
+
 ## Resamples a bridge/tunnel line every 3 m and assigns the road surface height.
+## `pins` fixes a bridge's start/end heights where it joins another deck (NAN: free).
 ## Returns {pts, heights}.
-func _structure_profile(line: PackedVector2Array, kind: String, layer: int, sunk := false) -> Dictionary:
+func _structure_profile(line: PackedVector2Array, kind: String, layer: int, sunk := false,
+		pins := Vector2(NAN, NAN)) -> Dictionary:
 	var pts := _resample(line, 3.0)
 	var n := pts.size()
 	var dist := PackedFloat32Array([0.0])
@@ -848,10 +887,12 @@ func _structure_profile(line: PackedVector2Array, kind: String, layer: int, sunk
 	var start_real := _real_end(pts[0])
 	var end_real := _real_end(pts[n - 1])
 	var contained := start_real and end_real
+	var e0 := ground[0] if is_nan(pins.x) else pins.x
+	var e1 := ground[n - 1] if is_nan(pins.y) else pins.y
 	var hs := PackedFloat32Array()
 	hs.resize(n)
 	for k in n:
-		var grade := lerpf(ground[0], ground[n - 1], dist[k] / maxf(total, 0.01))
+		var grade := lerpf(e0, e1, dist[k] / maxf(total, 0.01))
 		if kind == "bridge":
 			var env := -INF  # upper envelope of what the deck must clear
 			for j in n:
@@ -870,11 +911,11 @@ func _structure_profile(line: PackedVector2Array, kind: String, layer: int, sunk
 	var end_drop := TUNNEL_COVER if sunk else 0.0
 	for k in n:
 		if start_real:
-			var g0 := ground[0] - end_drop
+			var g0 := e0 - end_drop
 			hs[k] = clampf(hs[k], g0 - grade_limit * dist[k], g0 + grade_limit * dist[k])
 		if end_real:
 			var d := total - dist[k]
-			var g1 := ground[n - 1] - end_drop
+			var g1 := e1 - end_drop
 			hs[k] = clampf(hs[k], g1 - grade_limit * d, g1 + grade_limit * d)
 	return {pts = pts, heights = _smooth(hs, 5)}
 
@@ -1371,14 +1412,57 @@ func _build_water_mesh() -> void:
 # --- Stage: roads --------------------------------------------------------------------
 
 ## Half width for a road: OSM widths cover the travel lanes; urban side streets also
-## get parking lanes.
+## get parking lanes where the buildings either side leave room for them.
 func _road_hw(cls: String, pts: PackedVector2Array) -> float:
 	var spec: Array = ROADS[cls]
 	var hw: float = spec[0]
 	var rank: int = spec[1]
 	if (rank == 4 or rank == 5) and _urban_at(pts[pts.size() / 2]):
-		hw += 2.2
+		if _street_room(pts) - RoadNetwork.PAVEMENT - 0.3 >= hw + PARKING * 0.75:
+			hw += PARKING
 	return hw
+
+
+const PARKING := 2.2  ## extra half width for a parking lane
+
+
+## Half the typical gap between the buildings either side of a street (INF if open).
+## Samples straight out from the centre line on each side and takes a low quartile, so
+## a single gap between buildings doesn't widen a narrow street.
+func _street_room(pts: PackedVector2Array) -> float:
+	var cell := size / MASK_RES
+	var reach := 14.0
+	var gaps := PackedFloat32Array()
+	for k in pts.size() - 1:
+		var a := pts[k]
+		var b := pts[k + 1]
+		var len := a.distance_to(b)
+		if len < 0.01:
+			continue
+		var t := (b - a) / len
+		var n := Vector2(-t.y, t.x)
+		var d := 2.0
+		while d < len:
+			var p := a + t * d
+			d += 8.0
+			if p.x < 0.0 or p.y < 0.0 or p.x >= size or p.y >= size:
+				continue
+			var span := 0.0
+			for side: float in [1.0, -1.0]:
+				var x := 1.0
+				while x < reach:
+					var q := p + n * side * x
+					var i := int(q.x / cell)
+					var j := int(q.y / cell)
+					if i >= 0 and j >= 0 and i < MASK_RES and j < MASK_RES and _mask[j * MASK_RES + i] == 2:
+						break
+					x += cell * 0.5
+				span += x
+			gaps.append(span * 0.5)
+	if gaps.is_empty():
+		return INF
+	gaps.sort()
+	return gaps[gaps.size() / 4]
 
 
 ## Pavements line built-up streets from side streets up to trunk roads (not motorways).
@@ -1565,7 +1649,7 @@ func _build_roads() -> void:
 			if _osm_lamps.size() < MIN_MAPPED_LAMPS:
 				_place_lamps(pts, heights, hw, lift, _road_paved(road.cls, road.pts))
 		if not structure:
-			_place_street_props(pts, heights, hw, lift, rank, road_idx)
+			_place_street_props(pts, heights, hw, lift, rank, road_idx, hw > ROADS[road.cls][0] + 1.0)
 	roads = {vertices = verts, uvs = uvs, uv2s = uv2s, colors = colors, indices = indices}
 	_collect_road_faces(verts, indices)
 	# Keep trees off the pavements (props above are placed before this).
@@ -2077,7 +2161,7 @@ func _place_lamps(pts: PackedVector2Array, heights: PackedFloat32Array, hw: floa
 ## Parked cars along urban side streets and street furniture on the pavement. (Junction
 ## signs and signals come from RoadNetwork.)
 func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, hw: float,
-		lift: float, rank: int, road_idx: int) -> void:
+		lift: float, rank: int, road_idx: int, parking: bool) -> void:
 	var rng := RandomNumberGenerator.new()
 	rng.seed = hash(pts[0]) ^ _seed
 	var mask_cell := size / MASK_RES
@@ -2097,7 +2181,7 @@ func _place_street_props(pts: PackedVector2Array, heights: PackedFloat32Array, h
 		return _mask[mj * MASK_RES + mi] == 0 and p.x > 0.0 and p.y > 0.0 and p.x < size and p.y < size
 	var urban := _class_at(pts[pts.size() / 2]) == Cls.URBAN
 	# Parked cars sit just inside the road edge, facing the direction of traffic.
-	if urban and (rank == 4 or rank == 5) and total > 40.0:
+	if urban and parking and (rank == 4 or rank == 5) and total > 40.0:
 		for side: float in [1.0, -1.0]:
 			var d := 12.0 + rng.randf() * 6.0
 			while d < total - 12.0:

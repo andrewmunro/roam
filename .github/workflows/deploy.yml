@@ -51,7 +51,7 @@ jobs:
           for f in build/web/index.wasm build/web/index.pck; do
             gzip -9 "$f"
           done
-          cp web/_headers build/web/_headers
+          cp web/_headers web/index.service.worker.js build/web/
           ls -la build/web
 
       - uses: actions/upload-artifact@v4

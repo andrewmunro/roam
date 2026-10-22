@@ -467,7 +467,9 @@ func _build_clusters() -> void:
 		var e: Dictionary = _edges[i]
 		if e.a == e.b or not _junction[e.a] or not _junction[e.b] or e.phantom:
 			continue
-		if e.len < minf(18.0, 2.0 * e.hw + 4.0):
+		# Merge when the two junction surfaces would overlap: each reaches about a
+		# carriageway width plus a corner radius from its node.
+		if e.len < minf(26.0, 2.0 * e.hw + 8.0):
 			parent[_find(parent, e.a)] = _find(parent, e.b)
 			e.internal = true
 	var groups := {}
@@ -484,7 +486,7 @@ func _build_clusters() -> void:
 		for a: int in nodes:
 			for b: int in nodes:
 				extent = maxf(extent, _node_pos[a].distance_to(_node_pos[b]))
-		if extent > 45.0:
+		if extent > 60.0:
 			for n: int in nodes:
 				for end: int in _node_ends[n]:
 					_edges[end >> 1].internal = false
@@ -828,6 +830,13 @@ func _kerb_prop(arm: Dictionary, s: float, out := 0.6) -> Transform3D:
 	return Transform3D(Basis(Vector3.UP.cross(z), Vector3.UP, z), Vector3(q.x, y, q.y))
 
 
+## Adds a kerbside prop unless it would stand on another carriageway (junctions
+## crowded together put one arm's kerb in the next road).
+func _kerb_instance(role: String, xf: Transform3D) -> void:
+	if not _on_other_road(Vector2(xf.origin.x, xf.origin.z), -1):
+		instances.append([role, xf])
+
+
 # --- Edges ------------------------------------------------------------------------------
 
 ## Tangent (forward along the edge) at a node end with no cut: mitred with the road it
@@ -1161,6 +1170,8 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 		var app := _approach(arm)
 		if arm.phantom or app == Vector2.ZERO:
 			continue
+		if arm.far_junction and arm.len < 30.0:
+			continue  # a short link to the next junction: controlled at that end
 		var cut: float = arm.cut
 		var room: float = (arm.len * 0.5 if arm.far_junction else arm.len) - cut
 		var stop_pt := _arm_point_near(arm, Pt.STOP)
@@ -1171,7 +1182,7 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 					_crossing(arm, cut + 0.5)
 					line_s = cut + 4.6
 				_across(arm, line_s, app.x, app.y, 0.3)
-				instances.append([RegionStyle.traffic_light_role(region), _kerb_prop(arm, line_s)])
+				_kerb_instance(RegionStyle.traffic_light_role(region), _kerb_prop(arm, line_s))
 			Ctl.ALL_STOP:
 				_stop(arm, app, room)
 			Ctl.MINI:
@@ -1192,7 +1203,7 @@ func _emit_controls(c: Dictionary, arms: Array[Dictionary]) -> void:
 					_triangle(arm, cut + 12.0, (app.x + app.y) * 0.5)
 				var sign_here: bool = arm.rank >= 4 and (not uk or major_rank >= 6 or _arm_point_near(arm, Pt.GIVE_WAY))
 				if sign_here:
-					instances.append(["sign_give_way", _kerb_prop(arm, cut + 1.2)])
+					_kerb_instance("sign_give_way", _kerb_prop(arm, cut + 1.2))
 				stats.give_way += 1
 
 
@@ -1238,7 +1249,7 @@ func _stop(arm: Dictionary, app: Vector2, room: float) -> void:
 		return
 	_across(arm, arm.cut + 1.0, app.x, app.y, 0.45)
 	if arm.rank >= 4:
-		instances.append(["sign_stop", _kerb_prop(arm, arm.cut + 1.4)])
+		_kerb_instance("sign_stop", _kerb_prop(arm, arm.cut + 1.4))
 	stats.stops += 1
 
 
@@ -1416,8 +1427,8 @@ func _ring_mouth(r: Dictionary, arm: Dictionary) -> void:
 		_across(arm, maxf(arm.s_exit + 0.3, 0.5), app.x, app.y, 0.25, 0.6, 0.3)
 		stats.give_way += 1
 		if arm.rank >= 4 and arm.cut + 2.0 < arm.len:
-			instances.append(["sign_give_way" if not north_america else "sign_stop",
-				_kerb_prop(arm, arm.s_exit + 1.5)])
+			_kerb_instance("sign_give_way" if not north_america else "sign_stop",
+				_kerb_prop(arm, arm.s_exit + 1.5))
 
 
 ## First point where the ray from p along d reaches the circle (or p if it never does).

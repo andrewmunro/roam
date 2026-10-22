@@ -5,7 +5,8 @@ extends Node
 ## --latlon=lat,lon --heading=deg spawn like a shared link; --cam=lat,lon,h,heading,pitch
 ## (repeatable) places the camera for each shot in turn (h above whatever the ray hits).
 ## --no-hud hides the HUD (clean backdrops for UI mockups); --ui=menu, --ui=search:<query> or
-## --ui=arrive:<place> (the place name and credits shown after a teleport)
+## --ui=arrive:<place> (the place name and credits shown after a teleport), or
+## --ui=search:<a>;<b> for two searches in a row (<b> typed once <a>'s results arrive)
 ## opens that HUD panel once the world has loaded.
 ## --touch shows the touch controls; --touch-drive also drives with simulated touches
 ## (gas pedal, then the steering stick pushed right).
@@ -25,6 +26,8 @@ var _look_around := false
 var _look_tunnel := false
 var _no_hud := false
 var _ui := ""  # --ui=search:<query> or --ui=menu: opens that HUD panel once the world is ready
+var _ui_next := ""  # --ui=search:<a>;<b>: <b> is typed and submitted once <a>'s results arrive
+var _ui_next_t := -1.0
 var _cams: Array[PackedFloat64Array] = []  # --cam=lat,lon,h,heading,pitch (repeatable): one per shot
 var _map_click := Vector2.INF  # --map-click=dx,dy: simulated minimap click (pixels from centre)
 var _tunnel_drive := 0  # 0 off, 1 waiting, 2 driving
@@ -227,15 +230,29 @@ func _process(delta: float) -> void:
 			elif _ui.begins_with("arrive:"):
 				hud.arrive(_ui.substr(7))
 			elif _ui.begins_with("search:"):
+				var queries := _ui.substr(7).split(";")
 				hud._open_search()
-				hud._search.text = _ui.substr(7)
-				hud._on_submit(_ui.substr(7))
+				hud._search.text = queries[0]
+				hud._on_submit(queries[0])
+				if queries.size() > 1:
+					_ui_next = queries[1]
 			_ui = ""
 		if not _cams.is_empty() and settled:
 			_place_cam(_cams[mini(_shot_idx, _cams.size() - 1)])
 		if not _shots.is_empty() and settled:
 			_save_shot(_shots.path_join("shot_%02d.png" % _shot_idx))
 			_shot_idx += 1
+	# Second search of --ui=search:<a>;<b>: once <a>'s results are up, type <b> over the field
+	# (insert_text_at_caret emits text_changed like real typing) and press Enter.
+	if not _ui_next.is_empty() and _main.has_node("HUD"):
+		var hud: Node = _main.get_node("HUD")
+		if not hud._result_names.is_empty() and _ui_next_t < 0.0:
+			_ui_next_t = _t + 3.0
+		if _ui_next_t >= 0.0 and _t >= _ui_next_t:
+			hud._search.clear()
+			hud._search.insert_text_at_caret(_ui_next)
+			hud._on_submit(_ui_next)
+			_ui_next = ""
 	if _t > float(OS.get_environment("RUN_SECONDS") if OS.has_environment("RUN_SECONDS") else "40"):
 		get_tree().quit()
 
