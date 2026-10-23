@@ -1,0 +1,98 @@
+{
+	"birmingham_aston_expressway": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 7311,
+		"overlap": 593.21955370903,
+		"tilted": 507.205134410698,
+		"walls": 0.0
+	},
+	"birmingham_spaghetti": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 6700,
+		"overlap": 1570.31579697132,
+		"tilted": 1091.72677681509,
+		"walls": 0.0
+	},
+	"giza_ring_road": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 17692,
+		"overlap": 1238.76981818676,
+		"tilted": 5746.2692628162,
+		"walls": 0.811593453089396
+	},
+	"knaresborough_iles_lane": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 4977,
+		"overlap": 57.7850468158722,
+		"tilted": 482.012703838019,
+		"walls": 0.0
+	},
+	"leeds_onramp": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 10872,
+		"overlap": 886.531295657158,
+		"tilted": 274.654856681556,
+		"walls": 144.034217278163
+	},
+	"leeds_portal": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 10637,
+		"overlap": 17.0218198299408,
+		"tilted": 48.1374453819603,
+		"walls": 55.8963592847188
+	},
+	"london_hyde_park_corner": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 10861,
+		"overlap": 0.0,
+		"tilted": 14.9784993478754,
+		"walls": 0.0
+	},
+	"manchester_mancunian_way": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 12234,
+		"overlap": 12.8402699232101,
+		"tilted": 9.86960903547606,
+		"walls": 4.78745198249817
+	},
+	"paris_porte_maillot": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 12604,
+		"overlap": 845.982838869095,
+		"tilted": 429.55711967281,
+		"walls": 258.099926789602
+	},
+	"sf_broadway_tunnel": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 13852,
+		"overlap": 582.390520691872,
+		"tilted": 3870.250310875,
+		"walls": 58.1736793518067
+	},
+	"sf_sunset": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 8272,
+		"overlap": 149.29037976265,
+		"tilted": 34.2137813312484,
+		"walls": 0.0
+	},
+	"sf_us101": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 16621,
+		"overlap": 62.0854328870773,
+		"tilted": 132.858363187696,
+		"walls": 0.0
+	}
+}

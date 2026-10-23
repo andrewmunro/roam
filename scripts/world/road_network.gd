@@ -65,6 +65,9 @@ var signal_spots: Array[Vector2] = []  ## centres of signalised junctions (for t
 ## Own edges that need structures (decks, tunnel tubes, cutting walls), whole (junction
 ## surfaces included): {pts, hs (centre line surface), hw, rank, kind, portal: [start, end]}.
 var drawn: Array[Dictionary] = []
+## Carriageway surfaces (and roundabout islands) out of tunnels, as triangles (a, b, c, ...): the ground stays
+## under these (ChunkBuilder._ground_under_roads, which leaves decks high above alone).
+var ground_tris := PackedVector3Array()
 
 var _lines: Array[Dictionary] = []
 var _node_pos := PackedVector2Array()
@@ -199,8 +202,27 @@ func _level(p: Vector2, mask: int) -> float:
 	return levels.surface(p, mask) if levels != null else NAN
 
 
+var _top_at := Vector2(INF, INF)  # _terrain_top's last point and answer
+var _top := 0.0
+
+
+## Half widths (left, right) of a road at p heading `dir`, narrowed where another runs
+## alongside at a different level (RoadLevels.fit).
+func _fit(p: Vector2, dir: Vector2, hw: float) -> Vector2:
+	return levels.fit(p, dir, hw) if levels != null else Vector2(hw, hw)
+
+
 ## Highest terrain within SURFACE_REACH of p.
 func _terrain_top(p: Vector2) -> float:
+	# Callers often pass it as surface_at's hint for the same point, which asks again.
+	if p == _top_at:
+		return _top
+	_top_at = p
+	_top = _terrain_top_uncached(p)
+	return _top
+
+
+func _terrain_top_uncached(p: Vector2) -> float:
 	if terrain_n == 0:  # no grid given (tests): sample through height_at
 		var g: float = height_at.call(p)
 		for d in [Vector2(SURFACE_REACH, 0), Vector2(-SURFACE_REACH, 0), Vector2(0, SURFACE_REACH),
@@ -883,9 +905,18 @@ func _fill(poly: PackedVector2Array, hs: PackedFloat32Array, color: Color, centr
 		var mid := _vert(Vector3(centre.x, h, centre.y), Vector2(0.5, 0.0), Vector2.ZERO, color)
 		for k in poly.size():
 			_tri(mid, base + k, base + (k + 1) % poly.size())
+			_ground_tri(verts[mid], verts[base + k], verts[base + (k + 1) % poly.size()])
 		return
 	for t in range(0, tris.size(), 3):
 		_tri(base + tris[t], base + tris[t + 1], base + tris[t + 2])
+		_ground_tri(verts[base + tris[t]], verts[base + tris[t + 1]], verts[base + tris[t + 2]])
+
+
+## Adds a triangle of junction surface to ground_tris unless it's in a tunnel.
+func _ground_tri(a: Vector3, b: Vector3, c: Vector3) -> void:
+	var mid := Vector2(a.x + b.x + c.x, a.z + b.z + c.z) / 3.0
+	if levels == null or levels.heights_at(mid, RoadLevels.TUNNEL_BIT).is_empty():
+		ground_tris.append_array([a, b, c])
 
 
 ## Paint quad (corners in order), lying on the road surface.
@@ -1035,13 +1066,20 @@ func _emit_edge(e: Dictionary) -> void:
 	for k in ss.size():
 		var p := _point_at(pts, dist, ss[k])
 		var n := Vector2(-tans[k].y, tans[k].x)
-		left.append(p + n * hw)
-		right.append(p - n * hw)
+		var w := _fit(p, tans[k], hw)
+		left.append(p + n * w.x)
+		right.append(p - n * w.y)
 		var hint := _level(p, 1 << e.kind)
 		hl.append(surface_at(left[k], e.rank, 1 << e.kind, hint))
 		hr.append(surface_at(right[k], e.rank, 1 << e.kind, hint))
 		if not meshed:
 			continue  # the terrain is the road surface (see road_mask)
+		if k > 0 and e.kind != RoadLevels.Kind.TUNNEL:
+			var l0 := Vector3(left[k - 1].x, hl[k - 1], left[k - 1].y)
+			var r0 := Vector3(right[k - 1].x, hr[k - 1], right[k - 1].y)
+			var l1 := Vector3(left[k].x, hl[k], left[k].y)
+			var r1 := Vector3(right[k].x, hr[k], right[k].y)
+			ground_tris.append_array([l0, r0, l1, r0, r1, l1])
 		var v := (ss[k] - c0) * scale
 		_vert(Vector3(left[k].x, hl[k], left[k].y), Vector2(0, v), uv2, color)
 		_vert(Vector3(right[k].x, hr[k], right[k].y), Vector2(1, v), uv2, color)
@@ -1080,8 +1118,13 @@ func _note_drawn(e: Dictionary) -> void:
 			pts.append(src[k].lerp(src[k + 1], float(st) / steps))
 	pts.append(src[src.size() - 1])
 	var hs := PackedFloat32Array()
-	for p in pts:
-		hs.append(surface_at(p, e.rank, 1 << e.kind))
+	var wl := PackedFloat32Array()
+	var wr := PackedFloat32Array()
+	for k in pts.size():
+		hs.append(surface_at(pts[k], e.rank, 1 << e.kind))
+		var w := _fit(pts[k], (pts[mini(k + 1, pts.size() - 1)] - pts[maxi(k - 1, 0)]).normalized(), e.hw)
+		wl.append(w.x)
+		wr.append(w.y)
 	# A tunnel's portal is an end where it meets a road out in the open.
 	var portal := [false, false]
 	if e.kind == RoadLevels.Kind.TUNNEL:
@@ -1090,7 +1133,7 @@ func _note_drawn(e: Dictionary) -> void:
 			for end: int in _node_ends[node]:
 				if _edges[end >> 1].kind != RoadLevels.Kind.TUNNEL:
 					portal[side] = true
-	drawn.append({pts = pts, hs = hs, hw = e.hw, rank = e.rank, kind = e.kind, portal = portal})
+	drawn.append({pts = pts, hs = hs, hw = e.hw, wl = wl, wr = wr, rank = e.rank, kind = e.kind, portal = portal})
 
 
 static func _point_at(pts: PackedVector2Array, dist: PackedFloat32Array, d: float) -> Vector2:
@@ -1595,6 +1638,7 @@ func _disc(centre: Vector2, radius: float, h: float, color: Color, paint := fals
 		_vert(Vector3(p.x, h + (0.02 if paint else 0.0), p.y), Vector2.ZERO, uv2, color)
 	for k in seg:
 		_tri(mid, base + k, base + (k + 1) % seg)
+		ground_tris.append_array([verts[mid], verts[base + k], verts[base + (k + 1) % seg]])
 
 
 # --- Roundabouts ------------------------------------------------------------------------
@@ -1622,6 +1666,7 @@ func _emit_ring(r: Dictionary) -> void:
 		var a := base + k * 2
 		var b := base + ((k + 1) % seg) * 2
 		_quad(a, a + 1, b + 1, b)
+		ground_tris.append_array([verts[a], verts[a + 1], verts[b + 1], verts[a], verts[b + 1], verts[b]])
 	# Wide rings get a dashed line between their two lanes.
 	if r.hw * 2.0 >= 8.0:
 		var dashes := maxi(roundi(TAU * radius / 6.0), 8)

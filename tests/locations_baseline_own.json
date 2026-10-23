@@ -1,0 +1,98 @@
+{
+	"birmingham_aston_expressway": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 8373,
+		"overlap": 620.019740223885,
+		"tilted": 532.925905059593,
+		"walls": 0.0
+	},
+	"birmingham_spaghetti": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 7499,
+		"overlap": 1318.91168832779,
+		"tilted": 1092.69360304538,
+		"walls": 0.0
+	},
+	"giza_ring_road": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 19488,
+		"overlap": 1964.05517935753,
+		"tilted": 5910.54812751801,
+		"walls": 23.5399216810862
+	},
+	"knaresborough_iles_lane": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 5026,
+		"overlap": 41.34514939785,
+		"tilted": 479.020973143266,
+		"walls": 0.0
+	},
+	"leeds_onramp": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 11084,
+		"overlap": 75.6340380907059,
+		"tilted": 236.514808671086,
+		"walls": 76.3464212417602
+	},
+	"leeds_portal": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 10870,
+		"overlap": 5.6739399433136,
+		"tilted": 27.2064266673274,
+		"walls": 20.0974873701731
+	},
+	"london_hyde_park_corner": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 11644,
+		"overlap": 39.1302856206894,
+		"tilted": 12.6654205366558,
+		"walls": 0.0
+	},
+	"manchester_mancunian_way": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 12562,
+		"overlap": 0.0,
+		"tilted": 11.3057991233184,
+		"walls": 4.78745198249817
+	},
+	"paris_porte_maillot": {
+		"buried": 8.77696990966797,
+		"buried_worst": 2.04852615456073,
+		"ms": 14994,
+		"overlap": 727.463236927986,
+		"tilted": 1170.13207360487,
+		"walls": 363.670813322067
+	},
+	"sf_broadway_tunnel": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 15093,
+		"overlap": 825.802484750748,
+		"tilted": 2741.14804219455,
+		"walls": 98.6958577632904
+	},
+	"sf_sunset": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 8534,
+		"overlap": 275.838215947151,
+		"tilted": 27.1056457315162,
+		"walls": 0.0
+	},
+	"sf_us101": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"ms": 18404,
+		"overlap": 95.9833374023438,
+		"tilted": 107.078095514854,
+		"walls": 0.0
+	}
+}

@@ -32,7 +32,11 @@ const WATER_CLEAR := 5.0
 const JOIN := 1.0  ## line ends this close to another road's point join it
 const REACH := 2.5  ## how far past a road's edge surface() still finds it
 const LEVEL_GAP := 1.5  ## roads further apart in height than this are separate levels
-const GRID := 12.0
+const GRID := 6.0
+const MERGE := 60.0  ## overlapping roads joined within this distance are merging, not stacked
+const RAMP_END := 25.0  ## side-by-side overlaps this near a road's end are a ramp landing
+const FIT_GAP := 0.3  ## room left between roads squeezed side by side at different levels
+const FIT_MIN := 0.55  ## a squeezed road keeps at least this share of its half width
 const PORTAL_GAP := 250.0  ## roads linking two tunnel portals this close stay down in the cutting
 
 var dem: Callable  ## (Vector2) -> float, raw elevation in chunk space (valid past the tile)
@@ -46,9 +50,19 @@ var _line := PackedInt32Array()
 var _next := PackedInt32Array()  # next sample on the same line, or -1
 var _hw := PackedFloat32Array()
 var _links: Array[PackedInt32Array] = []
+var _road_links: Array[PackedInt32Array] = []  # _links before overlaps were linked: the roads themselves
 var _g := PackedFloat32Array()  # ground: DEM smoothed along the roads
 var _h := PackedFloat32Array()  # solved road height
 var _grid := {}  # Vector2i -> PackedInt32Array of segment starts (sample k to _next[k])
+var _ab := PackedVector2Array()  # segment k: _p[_next[k]] - _p[k]
+var _il2 := PackedFloat32Array()  # 1 / its length squared
+var _h1 := PackedFloat32Array()  # height at its far end
+var lo_limit := PackedFloat32Array()  # final limits per sample (for tools and tests)
+var hi_limit := PackedFloat32Array()
+var _wl := PackedFloat32Array()  # fitted half width per sample, left (+normal) and right
+var _wr := PackedFloat32Array()
+var _near_h := PackedFloat32Array()  # surface(): heights and distances of the roads in reach
+var _near_d := PackedFloat32Array()
 
 
 ## Adds a road. `layer` follows OSM (bridges default to 1, tunnels to -1); `bored`
@@ -69,6 +83,18 @@ func solve() -> void:
 	if _p.is_empty():
 		return
 	_join()
+	_road_links = _links.duplicate(true)
+	_heights()
+	# Roads whose surfaces overlap must be at one height, unless the first solve put
+	# them a clearance apart (a car park over a cutting): link those and solve again.
+	if _link_overlaps():
+		_heights()
+	_fit_widths()
+	_build_grid()
+
+
+## Ground, limits and crossings, then the heights between them (see solve).
+func _heights() -> void:
 	_ground()
 	var n := _p.size()
 	var target := _g.duplicate()
@@ -90,8 +116,14 @@ func solve() -> void:
 			_tunnel_limits(li, target, hi)
 	_link_portals(hi)
 	# Crossings push the structure (or the road diving under) apart until they clear.
-	for round_i in 4:
-		_h = _bounded(target, _envelope(lo, false), _envelope(hi, true))
+	var lo_env := PackedFloat32Array()
+	var hi_env := PackedFloat32Array()
+	for round_i in 5:
+		lo_env = _envelope(lo, false)
+		hi_env = _envelope(hi, true)
+		_h = _bounded(target, lo_env, hi_env)
+		if round_i == 4:
+			break  # the last round only applies the previous one's pushes
 		var moved := false
 		for c: Vector2i in crossings:
 			var up := c.x
@@ -115,8 +147,35 @@ func solve() -> void:
 				sum += _h[j]
 				cnt += 1
 			nxt[k] = sum / cnt
-		_h = nxt
-	_build_grid()
+		# Smoothing must not lift a tunnel into its roof or sink a deck onto the road below.
+		_h = _bounded(nxt, lo_env, hi_env)
+	lo_limit = lo_env
+	hi_limit = hi_env
+
+
+
+## Half widths (left, right) of the road through p heading `dir` with nominal half width
+## `hw`, fitted so roads side by side at different levels don't overlap (see
+## _fit_widths). Left is the side of Vector2(-dir.y, dir.x). (hw, hw) if no such road.
+func fit(p: Vector2, dir: Vector2, hw: float) -> Vector2:
+	var best := 1.0
+	var out := Vector2(hw, hw)
+	for k: int in _grid.get(Vector2i(floori(p.x / GRID), floori(p.y / GRID)), PackedInt32Array()):
+		if absf(_hw[k] - hw) > 0.6:
+			continue
+		var a := _p[k]
+		var t := clampf((p - a).dot(_ab[k]) * _il2[k], 0.0, 1.0)
+		var d := p.distance_to(a + _ab[k] * t)
+		var along := _ab[k].normalized().dot(dir)
+		if d >= best or absf(along) < 0.7:
+			continue
+		best = d
+		var j := _next[k]
+		var l := lerpf(_wl[k], _wl[j], t)
+		var r := lerpf(_wr[k], _wr[j], t)
+		out = Vector2(l, r) if along > 0.0 else Vector2(r, l)
+		out *= hw / _hw[k]
+	return out
 
 
 ## Road surface height at p (without any lift): a blend of the roads whose surface
@@ -128,45 +187,63 @@ func surface(p: Vector2, mask := ALL, reach := REACH, hint := NAN) -> float:
 	var cands: PackedInt32Array = _grid.get(Vector2i(floori(p.x / GRID), floori(p.y / GRID)), PackedInt32Array())
 	if cands.is_empty():
 		return NAN
-	# Two passes (closest road, then the blend at its level): this is called a lot, and
-	# allocating per call costs more than measuring twice.
+	# One pass over the cell's segments notes the roads in reach (into reused buffers:
+	# this is called a lot, and allocating per call costs more than the maths), then the
+	# blend runs over just those, at the level of the best one.
 	var best := INF
 	var ref := NAN
+	var n := 0
 	for k in cands:
 		if (1 << _kind[k]) & mask == 0:
 			continue
 		var a := _p[k]
-		var ab := _p[_next[k]] - a
-		var t := clampf((p - a).dot(ab) / maxf(ab.length_squared(), 1e-6), 0.0, 1.0)
+		var ab := _ab[k]
+		var t := clampf((p - a).dot(ab) * _il2[k], 0.0, 1.0)
 		var d := p.distance_to(a + ab * t) - _hw[k]
 		if d > reach:
 			continue
-		var h := lerpf(_h[k], _h[_next[k]], t)
+		var h := lerpf(_h[k], _h1[k], t)
 		var score := d if is_nan(hint) else absf(h - hint) + 0.05 * maxf(d, 0.0)
 		if score < best:
 			best = score
 			ref = h
-	if is_nan(ref):
+		if n == _near_h.size():
+			_near_h.resize(n * 2 + 8)
+			_near_d.resize(n * 2 + 8)
+		_near_h[n] = h
+		_near_d[n] = maxf(d, 0.0)
+		n += 1
+	if n == 0:
 		return NAN
 	var sum := 0.0
 	var wsum := 0.0
-	for k in cands:
+	for i in n:
+		if absf(_near_h[i] - ref) > LEVEL_GAP:
+			continue
+		var w := 1.0 / (0.25 + _near_d[i] * _near_d[i])
+		sum += _near_h[i] * w
+		wsum += w
+	return sum / wsum
+
+
+## Heights of every road surface of the kinds in `mask` covering p (within its width),
+## one per road: where a road bends, the segment nearest p.
+func heights_at(p: Vector2, mask := ALL) -> PackedFloat32Array:
+	var by_line := {}  # line -> Vector2(distance, height)
+	for k: int in _grid.get(Vector2i(floori(p.x / GRID), floori(p.y / GRID)), PackedInt32Array()):
 		if (1 << _kind[k]) & mask == 0:
 			continue
 		var a := _p[k]
-		var ab := _p[_next[k]] - a
-		var t := clampf((p - a).dot(ab) / maxf(ab.length_squared(), 1e-6), 0.0, 1.0)
-		var d := p.distance_to(a + ab * t) - _hw[k]
-		if d > reach:
-			continue
-		var h := lerpf(_h[k], _h[_next[k]], t)
-		if absf(h - ref) > LEVEL_GAP:
-			continue
-		d = maxf(d, 0.0)
-		var w := 1.0 / (0.25 + d * d)
-		sum += h * w
-		wsum += w
-	return sum / wsum
+		var t := clampf((p - a).dot(_ab[k]) * _il2[k], 0.0, 1.0)
+		var d := p.distance_to(a + _ab[k] * t)
+		var left := _ab[k].cross(p - a) > 0.0  # the Vector2(-dir.y, dir.x) side
+		var w := lerpf(_wl[k], _wl[_next[k]], t) if left else lerpf(_wr[k], _wr[_next[k]], t)
+		if d <= w and d < (by_line.get(_line[k], Vector2(INF, 0.0)) as Vector2).x:
+			by_line[_line[k]] = Vector2(d, lerpf(_h[k], _h1[k], t))
+	var out := PackedFloat32Array()
+	for v: Vector2 in by_line.values():
+		out.append(v.y)
+	return out
 
 
 ## How far the open road at p lies below the ground (0 if none, or at grade): roads in
@@ -260,6 +337,12 @@ func _join() -> void:
 							continue
 						var lj: Dictionary = _lines[_line[j]]
 						var j_end: bool = j == lj.first or j == lj.first + lj.count - 1
+						# A street meets a tunnel or bridge only where one carries on from the other
+						# (a portal, a bridge end): never partway, and not a lane in a car park that
+						# happens to end over a tunnel mouth.
+						var other_kind := _kind[j] != _kind[k]
+						if other_kind and not (is_end and _continues(k, j)):
+							continue
 						# Interior points only join interior points they coincide with.
 						if not is_end and not j_end and (lj.vertex as PackedByteArray)[j - lj.first] == 0:
 							continue
@@ -268,9 +351,12 @@ func _join() -> void:
 						# road meeting a carriageway between its mapped points).
 						if is_end and _next[j] >= 0:
 							var q := Geometry2D.get_closest_point_to_segment(_p[k], _p[j], _p[_next[j]])
+							var nearer := j if q.distance_to(_p[j]) <= q.distance_to(_p[_next[j]]) else _next[j]
+							if other_kind and not _continues(k, nearer):
+								continue
 							if q.distance_to(_p[k]) < best_d:
 								best_d = q.distance_to(_p[k])
-								best = j if q.distance_to(_p[j]) <= q.distance_to(_p[_next[j]]) else _next[j]
+								best = nearer
 							continue
 						if d < best_d:
 							best_d = d
@@ -278,6 +364,156 @@ func _join() -> void:
 			if best >= 0 and not _links[k].has(best):
 				_links[k].append(best)
 				_links[best].append(k)
+
+
+## Links samples of different roads of one kind whose surfaces overlap (a slip road
+## running into a carriageway, twin carriageways or ramps mapped close together; at
+## different layers only where they merge, see _merges): two surfaces in the same place
+## must be at one height, so a slip road is pulled down to the
+## cutting it merges into and climbs out at MAX_GRADE from there, instead of hanging
+## over the carriageway beside it. Pairs the first solve put CLEAR apart are left: one
+## is stacked over the other. True if any link was added.
+func _link_overlaps() -> bool:
+	var added := false
+	const CELL := 8.0
+	var hash := {}
+	var widest := 0.0
+	for k in _p.size():
+		widest = maxf(widest, _hw[k])
+		var c := Vector2i((_p[k] / CELL).floor())
+		if hash.has(c):
+			hash[c].append(k)
+		else:
+			hash[c] = PackedInt32Array([k])
+	for k in _p.size():
+		var layer: int = _lines[_line[k]].layer
+		var r := ceili((_hw[k] + widest) / CELL)
+		var c := Vector2i((_p[k] / CELL).floor())
+		var best := {}  # line -> [sample, distance]: the nearest overlapping sample per road
+		for dy in range(-r, r + 1):
+			for dx in range(-r, r + 1):
+				for j: int in hash.get(c + Vector2i(dx, dy), PackedInt32Array()):
+					if _line[j] == _line[k] or _kind[j] != _kind[k]:
+						continue
+					if _lines[_line[j]].layer != layer and not _merges(k, _line[j]):
+						continue  # stacked at different layers: kept apart as a crossing
+					var d := _p[k].distance_to(_p[j])
+					if d >= _hw[k] + _hw[j] - 0.5 or absf(_h[k] - _h[j]) >= CLEAR:
+						continue
+					var cur: Array = best.get(_line[j], [-1, INF])
+					if d < cur[1]:
+						best[_line[j]] = [j, d]
+		for li: int in best:
+			var j: int = best[li][0]
+			if not _links[k].has(j):
+				_links[k].append(j)
+				_links[j].append(k)
+				added = true
+	return added
+
+
+func _is_end(k: int) -> bool:
+	var l: Dictionary = _lines[_line[k]]
+	return k == l.first or k == l.first + l.count - 1
+
+
+## True if line ends k and j meet head on (each carrying on where the other stops) and
+## are roads of a similar size.
+func _continues(k: int, j: int) -> bool:
+	if not _is_end(k) or not _is_end(j):
+		return false
+	if _hw[k] > _hw[j] * 2.0 or _hw[j] > _hw[k] * 2.0:
+		return false
+	return _end_dir(k).dot(_end_dir(j)) < -0.5
+
+
+## Direction a line leaves through its end sample k.
+func _end_dir(k: int) -> Vector2:
+	var l: Dictionary = _lines[_line[k]]
+	var inner: int = k + 1 if k == l.first else k - 1
+	return (_p[k] - _p[inner]).normalized()
+
+
+## Narrows roads where another runs alongside closer than their two widths allow (twin
+## carriageways mapped too close, a slip beside the main road at another level): each
+## gives up its share of the overlap on that side, FIT_GAP apart, keeping at least
+## FIT_MIN of its width. At one level only roads abreast (centres at least half their
+## widths apart) count, not one merging into or continuing another; roads a clearance
+## apart are stacked.
+func _fit_widths() -> void:
+	const CELL := 8.0
+	var n := _p.size()
+	_wl.resize(n)
+	_wr.resize(n)
+	var hash := {}
+	var widest := 0.0
+	for k in n:
+		_wl[k] = _hw[k]
+		_wr[k] = _hw[k]
+		widest = maxf(widest, _hw[k])
+		var c := Vector2i((_p[k] / CELL).floor())
+		if hash.has(c):
+			hash[c].append(k)
+		else:
+			hash[c] = PackedInt32Array([k])
+	for k in n:
+		var dir := _dir(k)
+		var nrm := Vector2(-dir.y, dir.x)
+		var r := ceili((_hw[k] + widest + FIT_GAP) / CELL)
+		var c := Vector2i((_p[k] / CELL).floor())
+		for dy in range(-r, r + 1):
+			for dx in range(-r, r + 1):
+				for j: int in hash.get(c + Vector2i(dx, dy), PackedInt32Array()):
+					if _line[j] == _line[k]:
+						continue
+					var dh := absf(_h[j] - _h[k])
+					if dh >= CLEAR - 0.6 or absf(_dir(j).dot(dir)) < 0.8:
+						continue
+					var lateral := nrm.dot(_p[j] - _p[k])
+					if dh <= LEVEL_GAP and absf(lateral) < 0.5 * (_hw[k] + _hw[j]):
+						continue  # at one level, only twins mapped too close: not merging or continuing
+					var along := absf(dir.dot(_p[j] - _p[k]))
+					if along > STEP:
+						continue  # its sample abreast of this one does the measuring
+					var overlap := _hw[k] + _hw[j] + FIT_GAP - absf(lateral)
+					if overlap <= 0.0:
+						continue
+					var w := maxf(_hw[k] * FIT_MIN, _hw[k] - overlap * _hw[k] / (_hw[k] + _hw[j]))
+					if lateral > 0.0:
+						_wl[k] = minf(_wl[k], w)
+					else:
+						_wr[k] = minf(_wr[k], w)
+	# Ease in and out along each road rather than stepping.
+	for li in _lines.size():
+		var l: Dictionary = _lines[li]
+		_wl = _ease_widths(_wl, l.first, l.count)
+		_wr = _ease_widths(_wr, l.first, l.count)
+
+
+## Widths of one line's samples, each the least within two samples, then averaged.
+static func _ease_widths(w: PackedFloat32Array, first: int, count: int) -> PackedFloat32Array:
+	var low := PackedFloat32Array()
+	low.resize(count)
+	for i in count:
+		low[i] = w[first + i]
+		for m in range(maxi(i - 2, 0), mini(i + 3, count)):
+			low[i] = minf(low[i], w[first + m])
+	for i in count:
+		var sum := 0.0
+		var cnt := 0
+		for m in range(maxi(i - 1, 0), mini(i + 2, count)):
+			sum += low[m]
+			cnt += 1
+		w[first + i] = minf(sum / cnt, w[first + i])
+	return w
+
+
+## Direction of travel at sample k.
+func _dir(k: int) -> Vector2:
+	var l: Dictionary = _lines[_line[k]]
+	var a := maxi(k - 1, int(l.first))
+	var b := mini(k + 1, int(l.first) + int(l.count) - 1)
+	return (_p[b] - _p[a]).normalized()
 
 
 ## DEM along the roads, smoothed over the graph so streets don't copy its bumps.
@@ -338,6 +574,12 @@ func _crossings() -> Array[Vector2i]:
 						continue
 					var x: Variant = Geometry2D.segment_intersects_segment(_p[k], _p[_next[k]], a, b)
 					if x == null:
+						# Side by side, surfaces overlapping by a metre or more: stacked lanes of
+						# an interchange, which need the clearance a crossing does (away from the
+						# ends, where a ramp comes down onto the road it joins).
+						var near := _side_by_side(k, j)
+						if near.x >= 0:
+							out.append(near if lk.layer > lj.layer else Vector2i(near.y, near.x))
 						continue
 					var key := Vector2i(mini(_line[k], _line[j]), maxi(_line[k], _line[j]))
 					# One limit per crossing (a crossing on a segment end is met twice).
@@ -352,6 +594,49 @@ func _crossings() -> Array[Vector2i]:
 						continue  # they meet at a junction here after all
 					out.append(Vector2i(sk, sj) if lk.layer > lj.layer else Vector2i(sj, sk))
 	return out
+
+
+## For segments k and j (on roads at different layers) whose surfaces overlap by 1 m
+## or more side by side: their nearest samples, as (on k, on j); (-1, -1) otherwise or
+## within RAMP_END of either road's end.
+func _side_by_side(k: int, j: int) -> Vector2i:
+	var none := Vector2i(-1, -1)
+	var best := INF
+	var pair := none
+	for sk: int in [k, _next[k]]:
+		for sj: int in [j, _next[j]]:
+			var d := _p[sk].distance_to(_p[sj])
+			if d < best:
+				best = d
+				pair = Vector2i(sk, sj)
+	if best > _hw[k] + _hw[j] - 1.0:
+		return none
+	if _from_end(pair.x) < RAMP_END or _from_end(pair.y) < RAMP_END or _merges(pair.x, _line[pair.y]):
+		return none
+	return pair
+
+
+## True if sample k's road meets road `li` within MERGE along the network (a merge or
+## split, whatever their layer tags say): overlapping there, the two come together.
+func _merges(k: int, li: int) -> bool:
+	var dist := {k: 0.0}
+	var front := [k]
+	while not front.is_empty():
+		var i: int = front.pop_back()
+		for j in _road_links[i]:
+			if _line[j] == li:
+				return true
+			var d: float = dist[i] + _p[i].distance_to(_p[j])
+			if d <= MERGE and d < dist.get(j, INF):
+				dist[j] = d
+				front.append(j)
+	return false
+
+
+## Distance along its road from sample k to the nearer end.
+func _from_end(k: int) -> float:
+	var l: Dictionary = _lines[_line[k]]
+	return minf(k - int(l.first), int(l.first) + int(l.count) - 1 - k) * STEP
 
 
 func _joined(a: int, b: int) -> bool:
@@ -495,23 +780,38 @@ func _envelope(limits: PackedFloat32Array, upper: bool) -> PackedFloat32Array:
 	return out
 
 
-static func _bounded(target: PackedFloat32Array, lo: PackedFloat32Array, hi: PackedFloat32Array) -> PackedFloat32Array:
+func _bounded(target: PackedFloat32Array, lo: PackedFloat32Array, hi: PackedFloat32Array) -> PackedFloat32Array:
 	var out := PackedFloat32Array()
 	out.resize(target.size())
 	for k in target.size():
 		if lo[k] > hi[k]:
-			out[k] = (lo[k] + hi[k]) * 0.5  # squeezed between two limits: split the difference
+			# Squeezed between two limits: clearance beats grade (a steeper ramp still
+			# drives, a road through a tunnel roof doesn't). A tunnel keeps under what
+			# crosses it, a bridge over it; a street splits the difference.
+			if _kind[k] == Kind.TUNNEL:
+				out[k] = hi[k]
+			elif _kind[k] == Kind.BRIDGE:
+				out[k] = lo[k]
+			else:
+				out[k] = (lo[k] + hi[k]) * 0.5
 		else:
 			out[k] = clampf(target[k], lo[k], hi[k])
 	return out
 
 
 func _build_grid() -> void:
+	# Per segment, what surface() needs without chasing _next.
+	_ab.resize(_p.size())
+	_il2.resize(_p.size())
+	_h1.resize(_p.size())
 	for k in _p.size():
 		if _next[k] < 0:
 			continue
 		var a := _p[k]
 		var b := _p[_next[k]]
+		_ab[k] = b - a
+		_il2[k] = 1.0 / maxf((b - a).length_squared(), 1e-6)
+		_h1[k] = _h[_next[k]]
 		var pad := _hw[k] + REACH
 		for gy in range(floori((minf(a.y, b.y) - pad) / GRID), floori((maxf(a.y, b.y) + pad) / GRID) + 1):
 			for gx in range(floori((minf(a.x, b.x) - pad) / GRID), floori((maxf(a.x, b.x) + pad) / GRID) + 1):

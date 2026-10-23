@@ -240,6 +240,25 @@ func _add_heightmap(c: Dictionary) -> void:
 		_add_trimesh("TerrainPatchCollision", _builder.terrain_patch_faces, 1 << (TERRAIN_LAYER - 1))
 
 
+## Faces less any with (next to) no area or an edge short enough for Jolt to weld its
+## ends together: one such face makes Jolt reject the whole shape.
+static func _without_degenerate(faces: PackedVector3Array) -> PackedVector3Array:
+	var out := PackedVector3Array()
+	out.resize(faces.size())
+	var n := 0
+	for i in range(0, faces.size(), 3):
+		var ab := faces[i + 1] - faces[i]
+		var ac := faces[i + 2] - faces[i]
+		if ab.cross(ac).length_squared() > 1e-6 and ab.length_squared() > 1e-4 and ac.length_squared() > 1e-4 \
+				and (ac - ab).length_squared() > 1e-4:
+			out[n] = faces[i]
+			out[n + 1] = faces[i + 1]
+			out[n + 2] = faces[i + 2]
+			n += 3
+	out.resize(n)
+	return out
+
+
 ## One static body holding a box per instance (shared shape per mesh variant).
 func _add_boxes(xfs: Array, aabb: AABB) -> void:
 	var shape := BoxShape3D.new()
@@ -255,6 +274,7 @@ func _add_boxes(xfs: Array, aabb: AABB) -> void:
 
 
 func _add_trimesh(node_name: String, faces: PackedVector3Array, layer := 1) -> void:
+	faces = _without_degenerate(faces)
 	if faces.is_empty():
 		return
 	var shape := ConcavePolygonShape3D.new()

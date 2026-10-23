@@ -24,6 +24,9 @@ func _ready() -> void:
 		if not _spawn_pending and not _place_on_road(target, car.global_transform.basis.z, 0.0, 400.0):
 			hud.set_status("No road there yet"))
 	hud.world_rebuild_requested.connect(_rebuild_here)
+	var tiles := _url_param("tiles")
+	if not tiles.is_empty():
+		TileSource.custom = tiles
 	var roads := _url_param("roads")
 	if roads == "mask" or roads == "mesh":
 		RoadNetwork.use_mask = roads == "mask"

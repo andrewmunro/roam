@@ -8,7 +8,6 @@ extends Node3D
 ## --roads-only hides buildings and scatter; --tiles=seam also builds the tiles beside the
 ## cameras' own (to check seams); --res is set with the window size (--resolution WxH).
 
-const TILEJSON_URL := "https://tiles.openfreemap.org/planet"
 const OSM_WAIT := 40.0  # Overpass is slow; only waited for when not cached
 
 var _out := ""
@@ -17,8 +16,9 @@ var _roads_only := false
 var _seam := false
 var _elev := ElevationSource.new()
 var _osm := OsmPoints.new()
-var _tile_url := ""
 var _chunks := {}  # Vector2i -> Chunk
+var _use_osm := true  # false: no Overpass details (lamps, signals, roofs), deterministic
+var _dump := PackedFloat64Array()  # lat, lon, radius: print solved road levels there
 
 
 func _ready() -> void:
@@ -31,6 +31,8 @@ func _ready() -> void:
 			_roads_only = true
 		elif a == "--tiles=seam":
 			_seam = true
+		elif a.begins_with("--dump="):
+			_dump = PackedFloat64Array(Array(a.substr(7).split(",")).map(func(v: String) -> float: return v.to_float()))
 	if _cams.is_empty() or _out.is_empty():
 		push_error("usage: --out=dir --cam=lat,lon,h,heading,pitch [...]")
 		get_tree().quit(1)
@@ -66,34 +68,20 @@ func _ready() -> void:
 
 
 func _load_tile_url() -> void:
-	var done := [false]
-	Fetch.request(TILEJSON_URL, func(ok: bool, body: PackedByteArray) -> void:
-		if ok:
-			Fetch._write_disk(TILEJSON_URL, body)
-		else:
-			body = Fetch._read_disk(TILEJSON_URL)
-		var json: Variant = JSON.parse_string(body.get_string_from_utf8()) if not body.is_empty() else null
-		if json is Dictionary and json.has("tiles"):
-			_tile_url = json.tiles[0]
-		done[0] = true, -1.0, false)
-	while not done[0]:
+	TileSource.start(get_tree())
+	while not TileSource.is_ready():
 		await get_tree().process_frame
 
 
 func _mvt(t: Vector2i) -> PackedByteArray:
-	var n := 1 << Geo.CHUNK_ZOOM
-	var url := _tile_url.replace("{z}", str(Geo.CHUNK_ZOOM)).replace("{x}", str(posmod(t.x, n))) \
-		.replace("{y}", str(clampi(t.y, 0, n - 1)))
-	var key := "mvt/%d/%d/%d" % [Geo.CHUNK_ZOOM, posmod(t.x, n), clampi(t.y, 0, n - 1)]
 	var out := [null]
-	Fetch.request(url, func(ok: bool, body: PackedByteArray) -> void: out[0] = body if ok else PackedByteArray(),
-		0.0, true, PackedStringArray(), key)
+	TileSource.fetch(t, func(ok: bool, body: PackedByteArray) -> void: out[0] = body if ok else PackedByteArray())
 	while out[0] == null:
 		await get_tree().process_frame
 	return out[0]
 
 
-func _build(t: Vector2i) -> void:
+func _build(t: Vector2i) -> ChunkBuilder:
 	var m := Geo.tile_origin_merc(t, Geo.CHUNK_ZOOM)
 	var s := Geo.tile_size_merc(Geo.CHUNK_ZOOM)
 	var elev_tiles := ElevationSource.tiles_for_rect(m[0] - s, m[1] - 2.0 * s, m[0] + 2.0 * s, m[1] + s)
@@ -101,8 +89,9 @@ func _build(t: Vector2i) -> void:
 	_elev.ensure(elev_tiles, 0.0, func() -> void: elev_done[0] = true)
 	var pad := RoadNetwork.MARGIN / Geo.scale
 	var osm_tiles := OsmPoints.tiles_for_rect(m[0] - pad, m[1] - s - pad, m[0] + s + pad, m[1] + pad)
-	var osm_done := [false]
-	_osm.ensure(osm_tiles, func() -> void: osm_done[0] = true)
+	var osm_done := [not _use_osm]
+	if _use_osm:
+		_osm.ensure(osm_tiles, func() -> void: osm_done[0] = true)
 	var mvt: PackedByteArray = await _mvt(t)
 	var neighbours := {}
 	for dy in range(-1, 2):
@@ -114,7 +103,7 @@ func _build(t: Vector2i) -> void:
 		await get_tree().process_frame
 		waited += get_process_delta_time()
 	var b := ChunkBuilder.new(t, ChunkBuilder.Lod.FULL, mvt, _elev.snapshot(elev_tiles), neighbours,
-		_osm.snapshot(osm_tiles))
+		_osm.snapshot(osm_tiles) if _use_osm else {})
 	# Pin edges to neighbours already built, as the streamer does.
 	var sides := {"w": Vector2i(-1, 0), "e": Vector2i(1, 0), "n": Vector2i(0, -1), "s": Vector2i(0, 1)}
 	var opposite := {"w": "e", "e": "w", "n": "s", "s": "n"}
@@ -125,6 +114,8 @@ func _build(t: Vector2i) -> void:
 	var tb := Time.get_ticks_msec()
 	b.run_all()
 	print("view_chunk: tile %s built in %d ms" % [t, Time.get_ticks_msec() - tb])
+	if not _dump.is_empty():
+		_dump_levels(b, t)
 	var chunk := Chunk.new()
 	chunk.setup(b)
 	add_child(chunk)
@@ -136,6 +127,32 @@ func _build(t: Vector2i) -> void:
 		for child in chunk.get_children():
 			if child.name.begins_with("Buildings") or child is MultiMeshInstance3D:
 				child.visible = false
+	return b
+
+
+## Solved levels of the roads near the --dump point: per line its kind (0 grade,
+## 1 bridge, 2 tunnel), layer, and per sample metres east/north of the point, the
+## ground (smoothed DEM), the solved height and the terrain after flattening.
+func _dump_levels(b: ChunkBuilder, t: Vector2i) -> void:
+	var origin := Geo.tile_origin_local(t, Geo.CHUNK_ZOOM)
+	var spot := Vector2(Geo.latlon_to_local(_dump[0], _dump[1]).x - origin.x, Geo.latlon_to_local(_dump[0], _dump[1]).z - origin.z)
+	var L: RoadLevels = b._levels
+	var last := -1
+	var line := ""
+	for k in L._p.size():
+		var rel := L._p[k] - spot
+		if rel.length() > _dump[2]:
+			continue
+		if L._line[k] != last:
+			if line != "":
+				print(line)
+			last = L._line[k]
+			var l: Dictionary = L._lines[last]
+			line = "L%d kind=%d layer=%d hw=%.1f bored=%s n=%d:" % [last, l.kind, l.layer, l.hw, l.bored, l.count]
+		line += " (%d,%d g%.1f h%.1f t%.1f d%.1f lim %.1f..%.1f)" % [rel.x, -rel.y, L._g[k], L._h[k], b.height_at(L._p[k]),
+			L.depth(L._p[k]), L.lo_limit[k], L.hi_limit[k]]
+	if line != "":
+		print(line)
 
 
 func _place(cam: Camera3D, c: PackedFloat64Array) -> void:

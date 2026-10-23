@@ -6,7 +6,6 @@ extends Node3D
 
 signal chunk_ready(chunk: Chunk)
 
-const TILEJSON_URL := "https://tiles.openfreemap.org/planet"
 const FULL_RADIUS := 1
 const FAR_RADIUS := 2
 const UNLOAD_RADIUS := 3
@@ -19,7 +18,6 @@ const OSM_WAIT := 1.0  # then build with guessed signals; real data rebuilds the
 
 var elevation := ElevationSource.new()
 var osm_points := OsmPoints.new()
-var _tile_url := ""
 var _chunks := {}  # Vector2i -> Chunk (shown)
 var _jobs := {}  # Vector2i -> {lod, state, builder, task, chunk, generation}
 var _generation := 0
@@ -34,24 +32,7 @@ func _ready() -> void:
 	Geo.origin_shifted.connect(_on_origin_shifted)
 	osm_points.attach(self)
 	osm_points.tile_loaded.connect(_on_osm_tile)
-	Fetch.request(TILEJSON_URL, _on_tilejson, -1.0, false)
-
-
-func _on_tilejson(ok: bool, body: PackedByteArray) -> void:
-	# The last good copy stands in when the server is unreachable or rate limiting us,
-	# so cached tiles still load.
-	if ok:
-		Fetch._write_disk(TILEJSON_URL, body)
-	else:
-		body = Fetch._read_disk(TILEJSON_URL)
-	if not body.is_empty():
-		var json: Variant = JSON.parse_string(body.get_string_from_utf8())
-		if json is Dictionary and json.has("tiles"):
-			_tile_url = json.tiles[0]
-	if _tile_url.is_empty():
-		push_error("Could not load TileJSON from %s; retrying" % TILEJSON_URL)
-		get_tree().create_timer(3.0).timeout.connect(
-			func() -> void: Fetch.request(TILEJSON_URL, _on_tilejson, -1.0, false))
+	TileSource.start(get_tree())
 
 
 ## Drops every chunk (used when teleporting / after Geo.set_origin).
@@ -144,7 +125,7 @@ func is_loading() -> bool:
 
 
 func _process(_delta: float) -> void:
-	if target == null or _tile_url.is_empty():
+	if target == null or not TileSource.is_ready():
 		return
 	var pos := target.global_position
 	if Vector2(pos.x, pos.z).length() > REBASE_DISTANCE:
@@ -222,20 +203,20 @@ func _start_job(t: Vector2i, lod: ChunkBuilder.Lod) -> void:
 				arrived.call()
 		osm_points.ensure(_osm_tiles(t), osm_arrived)
 		get_tree().create_timer(OSM_WAIT).timeout.connect(osm_arrived)
-		Fetch.request(_mvt_url(t), func(ok: bool, body: PackedByteArray) -> void:
+		TileSource.fetch(t, func(ok: bool, body: PackedByteArray) -> void:
 			if ok:
 				job.mvt = body
-			arrived.call(), priority, true, PackedStringArray(), _mvt_key(t))
+			arrived.call(), priority)
 		# Neighbours' roads, so bridges and tunnels can be followed across tile edges.
 		for dy in range(-1, 2):
 			for dx in range(-1, 2):
 				if dx == 0 and dy == 0:
 					continue
 				var offset := Vector2i(dx, dy)
-				Fetch.request(_mvt_url(t + offset), func(ok: bool, body: PackedByteArray) -> void:
+				TileSource.fetch(t + offset, func(ok: bool, body: PackedByteArray) -> void:
 					if ok:
 						job.neighbours[offset] = body
-					arrived.call(), priority + 0.3, true, PackedStringArray(), _mvt_key(t + offset))
+					arrived.call(), priority + 0.3)
 
 
 ## Overpass tiles covering a chunk and the margin RoadNetwork looks into.
@@ -244,19 +225,6 @@ func _osm_tiles(t: Vector2i) -> Array[Vector2i]:
 	var s := Geo.tile_size_merc(Geo.CHUNK_ZOOM)
 	var pad := RoadNetwork.MARGIN / Geo.scale
 	return OsmPoints.tiles_for_rect(m[0] - pad, m[1] - s - pad, m[0] + s + pad, m[1] + pad)
-
-
-## Disk cache key for a vector tile: the URL carries OpenFreeMap's weekly version, so
-## keyed on it every release would fetch the whole world again.
-func _mvt_key(t: Vector2i) -> String:
-	var n := 1 << Geo.CHUNK_ZOOM
-	return "mvt/%d/%d/%d" % [Geo.CHUNK_ZOOM, posmod(t.x, n), clampi(t.y, 0, n - 1)]
-
-
-func _mvt_url(t: Vector2i) -> String:
-	var n := 1 << Geo.CHUNK_ZOOM
-	return _tile_url.replace("{z}", str(Geo.CHUNK_ZOOM)) \
-		.replace("{x}", str(posmod(t.x, n))).replace("{y}", str(clampi(t.y, 0, n - 1)))
 
 
 ## Creates the builder for a job whose data has arrived. Full chunks pin their edges to
