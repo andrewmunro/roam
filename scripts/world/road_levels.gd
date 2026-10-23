@@ -33,6 +33,8 @@ const JOIN := 1.0  ## line ends this close to another road's point join it
 const REACH := 2.5  ## how far past a road's edge surface() still finds it
 const LEVEL_GAP := 1.5  ## roads further apart in height than this are separate levels
 const GRID := 6.0
+const OVERLAP_PARALLEL := 0.7  ## overlapping roads more than LEVEL_GAP apart are linked only if this parallel (|cos|)
+const JOIN_CROSS := 20.0  ## roads that join within this along the network don't cross nearby
 const MERGE := 60.0  ## overlapping roads joined within this distance are merging, not stacked
 const RAMP_END := 25.0  ## side-by-side overlaps this near a road's end are a ramp landing
 const FIT_GAP := 0.3  ## room left between roads squeezed side by side at different levels
@@ -367,7 +369,9 @@ func _join() -> void:
 
 
 ## Links samples of different roads of one kind whose surfaces overlap (a slip road
-## running into a carriageway, twin carriageways or ramps mapped close together; at
+## running into a carriageway, twin carriageways or ramps mapped close together; roads
+## at an angle only if already near one level, so a street passing under a bridge's
+## approach isn't tied to it; at
 ## different layers only where they merge, see _merges): two surfaces in the same place
 ## must be at one height, so a slip road is pulled down to the
 ## cutting it merges into and climbs out at MAX_GRADE from there, instead of hanging
@@ -400,6 +404,8 @@ func _link_overlaps() -> bool:
 					var d := _p[k].distance_to(_p[j])
 					if d >= _hw[k] + _hw[j] - 0.5 or absf(_h[k] - _h[j]) >= CLEAR:
 						continue
+					if absf(_dir(k).dot(_dir(j))) < OVERLAP_PARALLEL and absf(_h[k] - _h[j]) > LEVEL_GAP:
+						continue  # across it and well apart (a street passing under a bridge's ramp): not a merge
 					var cur: Array = best.get(_line[j], [-1, INF])
 					if d < cur[1]:
 						best[_line[j]] = [j, d]
@@ -590,8 +596,8 @@ func _crossings() -> Array[Vector2i]:
 					# The samples nearest the crossing on each road.
 					var sk := k if (x as Vector2).distance_to(_p[k]) < (x as Vector2).distance_to(_p[_next[k]]) else _next[k]
 					var sj := j if (x as Vector2).distance_to(a) < (x as Vector2).distance_to(b) else _next[j]
-					if _joined(sk, sj):
-						continue  # they meet at a junction here after all
+					if _joined(sk, sj) or _merges(sk, _line[sj], JOIN_CROSS):
+						continue  # they meet here after all (a ramp onto a footbridge's span)
 					out.append(Vector2i(sk, sj) if lk.layer > lj.layer else Vector2i(sj, sk))
 	return out
 
@@ -616,9 +622,9 @@ func _side_by_side(k: int, j: int) -> Vector2i:
 	return pair
 
 
-## True if sample k's road meets road `li` within MERGE along the network (a merge or
+## True if sample k's road meets road `li` within `reach` along the network (a merge or
 ## split, whatever their layer tags say): overlapping there, the two come together.
-func _merges(k: int, li: int) -> bool:
+func _merges(k: int, li: int, reach := MERGE) -> bool:
 	var dist := {k: 0.0}
 	var front := [k]
 	while not front.is_empty():
@@ -627,7 +633,7 @@ func _merges(k: int, li: int) -> bool:
 			if _line[j] == li:
 				return true
 			var d: float = dist[i] + _p[i].distance_to(_p[j])
-			if d <= MERGE and d < dist.get(j, INF):
+			if d <= reach and d < dist.get(j, INF):
 				dist[j] = d
 				front.append(j)
 	return false
@@ -683,7 +689,9 @@ func _bridge_limits(li: int, crossed: bool, lo: PackedFloat32Array) -> void:
 
 
 ## A dug-down tunnel stays TUNNEL_COVER under the surface (so the roads leading to it
-## sink into a cutting); a bored one runs straight from portal to portal.
+## sink into a cutting); a bored one runs straight from portal to portal, but no
+## shallower than TUNNEL_COVER once in from its portals at MAX_GRADE (a straight line
+## between portals either side of a river or a valley would run along the ground).
 func _tunnel_limits(li: int, target: PackedFloat32Array, hi: PackedFloat32Array) -> void:
 	var l: Dictionary = _lines[li]
 	var first: int = l.first
@@ -695,10 +703,12 @@ func _tunnel_limits(li: int, target: PackedFloat32Array, hi: PackedFloat32Array)
 		var total := 0.0
 		for i in range(1, count):
 			total += _p[first + i].distance_to(_p[first + i - 1])
+		var from_end := _end_distance(li)
 		for i in count:
 			if i > 0:
 				along += _p[first + i].distance_to(_p[first + i - 1])
-			target[first + i] = minf(lerpf(g0, g1, along / maxf(total, 0.01)), _g[first + i])
+			var cover := minf(TUNNEL_COVER, MAX_GRADE * from_end[i])
+			target[first + i] = minf(lerpf(g0, g1, along / maxf(total, 0.01)), _g[first + i] - cover)
 		return
 	for i in count:
 		var k := first + i

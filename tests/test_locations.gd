@@ -10,6 +10,8 @@ extends "res://tests/view_chunk.gd"
 ## (carriageway: the road mesh less kerbs, pavements and skirts, which share UV (0.5, 0)
 ## and an empty UV2)
 ##   walls    metres of retaining wall standing on a carriageway
+##   lifted   metres of road at grade solved more than LIFTED above its ground (bridge
+##            approaches top out near a clearance; higher is a solver runaway)
 ## Compares with tests/locations_baseline.json (tests/locations_baseline_own.json on our own
 ## tiles, ROAM_TILES; see tools/tiles) and fails if any spot got worse.
 ## --where lists the worst 20 m cells of each spot (lat,lon) to look at with tools/view.sh.
@@ -31,10 +33,13 @@ const SPOTS := [
 	["giza_ring_road", 29.98801, 31.21661],
 	["london_hyde_park_corner", 51.50270, -0.15270],
 	["paris_porte_maillot", 48.87800, 2.28300],
+	["leeds_armley_gyratory", 53.79456, -1.56540],
+	["nyc_lincoln_tunnel", 40.75838, -73.99772],
 ]
+const LIFTED := 7.0
 ## Worse than the baseline by more than this (and the absolute slack) fails.
 const TOLERANCE := 0.1
-const SLACK := {overlap = 20.0, buried = 10.0, buried_worst = 0.3, tilted = 5.0, walls = 5.0}
+const SLACK := {overlap = 20.0, buried = 10.0, buried_worst = 0.3, tilted = 5.0, walls = 5.0, lifted = 10.0}
 
 var _where := false
 var _cells := {}  # "metric" -> {Vector2i 20 m cell: amount}, for --where
@@ -63,8 +68,8 @@ func _ready() -> void:
 		var m := _measure(b)
 		m.ms = Time.get_ticks_msec() - t0
 		results[spot[0]] = m
-		print("%-28s overlap %7.0f m²  buried %6.0f m² (worst %5.2f m)  tilted %6.0f m²  walls %5.0f m  (%d ms)" % [
-			spot[0], m.overlap, m.buried, m.buried_worst, m.tilted, m.walls, m.ms])
+		print("%-28s overlap %7.0f m²  buried %6.0f m² (worst %5.2f m)  tilted %6.0f m²  walls %5.0f m  lifted %4.0f m  (%d ms)" % [
+			spot[0], m.overlap, m.buried, m.buried_worst, m.tilted, m.walls, m.lifted, m.ms])
 		if _where:
 			_print_where(b)
 		for c: Node in _chunks.values():
@@ -152,7 +157,15 @@ func _measure(b: ChunkBuilder) -> Dictionary:
 					walls += (w.a as Vector2).distance_to(w.b) / 3.0
 					_note("walls", q, (w.a as Vector2).distance_to(w.b) / 3.0)
 					break
-	return {overlap = overlap, buried = buried, buried_worst = worst, tilted = tilted, walls = walls}
+	# Roads at grade lifted far above their ground.
+	var lifted := 0.0
+	for k in L._p.size():
+		if L._next[k] < 0 or L._kind[k] != RoadLevels.Kind.GRADE or not inside.call(L._p[k]):
+			continue
+		if L._h[k] - L._g[k] > LIFTED:
+			lifted += L._p[k].distance_to(L._p[L._next[k]])
+			_note("lifted", L._p[k], L._p[k].distance_to(L._p[L._next[k]]))
+	return {overlap = overlap, buried = buried, buried_worst = worst, tilted = tilted, walls = walls, lifted = lifted}
 
 
 ## True if the terrain shader cuts the ground away at q (over a cutting, see
@@ -204,7 +217,7 @@ func _compare(results: Dictionary) -> bool:
 			continue
 		for key: String in SLACK:
 			var now: float = results[name][key]
-			var was: float = base[name][key]
+			var was: float = base[name].get(key, 0.0)
 			if now > was * (1.0 + TOLERANCE) + SLACK[key]:
 				print("  WORSE %s %s: %.1f -> %.1f" % [name, key, was, now])
 				ok = false

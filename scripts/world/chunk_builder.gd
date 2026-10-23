@@ -534,6 +534,7 @@ const TUNNEL_HEIGHT := 6.0
 const TUNNEL_MIN_RELIEF := 10.0
 const ROAD_COVER := 0.15  # terrain near an open road stays at least this far under it
 const MIN_RETAIN := 0.4  # a cutting wall stands only where its side is this far above the road
+const DECK_TOP := 0.2  # a bridge's deck slab tops out this far under its road surface
 const DECK_DROP := 0.4  # a dug-down tunnel's roof deck sits this far under the surface
 
 
@@ -914,6 +915,9 @@ func _flatten_roads() -> void:
 	weight.fill(0.0)
 	var target := PackedFloat32Array()
 	target.resize(_n * _n)
+	var nearest := PackedFloat32Array()  # distance to the road that set target
+	nearest.resize(_n * _n)
+	nearest.fill(INF)
 	for road in _flatten_lines:
 		var spec: Array = ROADS[road.cls]
 		var pts := _resample(road.pts, 10.0)
@@ -954,8 +958,11 @@ func _flatten_roads() -> void:
 						continue
 					var w := 1.0 - smoothstep(inner, outer, d)
 					var v := j * _n + i
-					if w > weight[v]:
+					# Two roads both flattening a vertex fully: the nearer one sets it (not
+					# whichever came first, which left one road floating over the other's level).
+					if w > weight[v] or (w == weight[v] and d < nearest[v]):
 						weight[v] = w
+						nearest[v] = d
 						target[v] = lerpf(hs[k], hs[k + 1], t)
 	# Apply flattening, then add procedural detail away from roads and water.
 	for j in _n:
@@ -1009,8 +1016,10 @@ func _keep_under_roads() -> void:
 ## Roads own the ground: every terrain vertex under or within a cell of a carriageway
 ## triangle at grade (RoadNetwork.ground_tris: roads as drawn, junctions and roundabouts
 ## included, wider than the centre lines _keep_under_roads sees where parking lanes or
-## junction corners widen them) is lowered ROAD_COVER under the triangle's lowest
-## corner, so the ground between vertices can't rise through the road either. The
+## junction corners widen them) is lowered ROAD_COVER under the triangle's surface at
+## the nearest point of it, so the ground between vertices can't rise through the road
+## either (and a big junction triangle on a slope doesn't drag the ground down to its
+## lowest corner, leaving the roads at its upper corners on a bank). The
 ## tile's edge vertices are pinned to the neighbours' and left alone. Triangles down in
 ## a cutting go to _sunk_tris instead, for the cut mask to open the ground over them.
 func _ground_under_roads(tris: PackedVector3Array) -> void:
@@ -1037,10 +1046,30 @@ func _ground_under_roads(tris: PackedVector3Array) -> void:
 		if low < ground - 2.0 or _levels.depth(mid, 1.0) > 0.5:
 			_sunk_tris.append(PackedVector3Array([a, b, c]))
 			continue
+		var a2 := Vector2(a.x, a.z)
+		var b2 := Vector2(b.x, b.z)
+		var c2 := Vector2(c.x, c.z)
+		var area := (b2 - a2).cross(c2 - a2)
+		if absf(area) < 1e-4:
+			continue
 		for vj in range(j0, j1 + 1):
 			for vi in range(i0, i1 + 1):
 				var v := vj * _n + vi
-				_h[v] = minf(_h[v], low)
+				if _h[v] <= low:
+					continue
+				# Height of the triangle's plane at the nearest point of the triangle.
+				var p := Vector2(vi * _cell, vj * _cell)
+				if not Geometry2D.point_is_inside_triangle(p, a2, b2, c2):
+					var q := Geometry2D.get_closest_point_to_segment(p, a2, b2)
+					for e: Vector2 in [Geometry2D.get_closest_point_to_segment(p, b2, c2),
+							Geometry2D.get_closest_point_to_segment(p, c2, a2)]:
+						if p.distance_squared_to(e) < p.distance_squared_to(q):
+							q = e
+					p = q
+				var wa := (b2 - p).cross(c2 - p) / area
+				var wb := (c2 - p).cross(a2 - p) / area
+				var top := wa * a.y + wb * b.y + (1.0 - wa - wb) * c.y
+				_h[v] = minf(_h[v], top - ROAD_COVER)
 
 
 static func _smooth(values: PackedFloat32Array, radius: int) -> PackedFloat32Array:
@@ -1463,7 +1492,9 @@ func _build_roads() -> void:
 			uvs.append_array([Vector2(0, along), Vector2(1, along)])
 			uv2s.append_array([uv2, uv2])
 			colors.append_array([color, color])
-			if k > 0 and (structure or not (_on_mask_road(pts[k - 1]) and _on_mask_road(pts[k]))):
+			# (a path's bridge stops where it comes down onto a road it crosses at grade)
+			if k > 0 and (structure or not (_on_mask_road(pts[k - 1]) and _on_mask_road(pts[k]))) \
+					and not (structure and _on_level_road(pts[k - 1], heights[k - 1]) and _on_level_road(pts[k], y)):
 				var a := base + (k - 1) * 2
 				indices.append_array([a, a + 1, a + 2, a + 1, a + 3, a + 2])
 				if not road.tunnel:
@@ -1558,6 +1589,15 @@ func _level_road_at(q: Vector2, h: float, mask := RoadLevels.STREETS) -> bool:
 	return not is_nan(o) and absf(o - h) < 1.5
 
 
+## True if another road's surface lies within 0.6 m of h at q (besides the one there).
+func _on_level_road(q: Vector2, h: float) -> bool:
+	var n := 0
+	for o in _levels.heights_at(q, RoadLevels.STREETS):
+		if absf(o - h) < 0.6:
+			n += 1
+	return n >= 2
+
+
 ## `wl`, `wr`: the road's half widths left and right of its centre line per point
 ## (fitted, see RoadLevels.fit).
 func _build_bridge(pts: PackedVector2Array, heights: PackedFloat32Array, wl: PackedFloat32Array,
@@ -1574,8 +1614,9 @@ func _build_bridge(pts: PackedVector2Array, heights: PackedFloat32Array, wl: Pac
 		var r := (wr[k - 1] + wr[k]) * 0.5
 		var hw := (l + r) * 0.5
 		var mid := side * (l - r) * 0.5  # the deck's centre off the road's centre line
-		# Deck slab under the road surface.
-		_s_beam(a + mid, b + mid, hw + 0.3, ya - 1.3, ya - 0.02, yb - 1.3, yb - 0.02, CONCRETE)
+		# Deck slab under the road surface (deep enough that a junction surface at the
+		# bridge's end, levelled with the roads meeting there, still covers it).
+		_s_beam(a + mid, b + mid, hw + 0.3, ya - 1.3, ya - DECK_TOP, yb - 1.3, yb - DECK_TOP, CONCRETE)
 		# Railings (collidable so the car stays on the bridge), except where another
 		# road shares the deck, e.g. a footway or junction joining it.
 		for s: float in [1.0, -1.0]:

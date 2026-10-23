@@ -89,10 +89,34 @@ Symptom fixes are paused unless the suite shows them as root-cause fixes.
   Cairo DEM still has building bumps the despike gate keeps (steep minor roads);
   classify stage ~1.7 s (was 0.7 s) from the two-pass solve.
 
+### Round 2 (user reports, Leeds + NYC)
+
+- Solver runaway: a street passing under a bridge's approach was overlap-linked to it, so
+  every crossing round lifted bridge and street another clearance (Armley gyratory,
+  roads ~20 m up). Overlapping roads at an angle now link only if already within
+  LEVEL_GAP. New suite metric `lifted` (road at grade >7 m over its ground): 2183 m -> 0.
+  Side effects: overlap Aston 593 -> 6, Spaghetti 1570 -> 363, Paris 846 -> 228.
+- Footbridge 10-16 m up: its ramp and span (layers 1 and 2) met end to end but crossed
+  nearby, so they were stacked. Roads that join within 20 m along the network don't count
+  as crossing there.
+- Bored tunnels (Lincoln Tunnel) ran portal to portal in a straight line along the ground
+  across the Hudson; now also TUNNEL_COVER deep once in from each portal at MAX_GRADE.
+- Ground clamp uses each triangle's own height at the vertex, not its lowest corner (a
+  big junction triangle on a slope dragged the ground down under the roads at its top).
+- Bridge deck slab tops 0.2 m under the road (a strip showed through junction surfaces).
+- Pavements: a kerb check every third point wiped ~30 m of pavement next to a block's
+  kerb (splitter island); points between disagreeing checks are now checked. Road edges
+  defer only to block kerbs actually drawn. Pavements are in ground_tris too.
+- Flattening: on a tie the nearer road sets a terrain vertex.
+
 ## Open
 
 | # | Issue | Where | Notes |
 |---|-------|-------|-------|
+| 18 | Porte Maillot junction surface slopes into the cutting (tilt 430 -> 1177 m² after the overlap-link change) | Paris 48.87584,2.27780 | Junction cluster takes in a sunk arm; not a T-snap or cluster merge. |
+| 19 | Terrain grid (11.5 m) can't sit under two nearby roads at different heights: the higher one stands on a bank | Leeds 53.81333,-1.58935 (heading 128) | Finer terrain near roads, or the road mask. |
+| 20 | NYC Lincoln Tunnel approaches: walls on roads 665 m, overlap 1271 m², 47 m lifted | 40.75838,-73.99772 | In the suite as nyc_lincoln_tunnel. |
+| 21 | Leeds gyratory lane counts | Armley gyratory | OpenFreeMap has no lanes; own tiles do (`?tiles=`). |
 | 14 | Junction surfaces in a cutting have no walls: ground at street level ends in an open edge above the road | Paris Porte Maillot 48.87700,2.27862 (heading 0) | Cut mask now opens over them; `_build_sides` only walls the cutting's lines. |
 | 15 | Own tiles: real lane widths crowd tightly mapped ramps and twins (overlap, tilt) | SF Sunset 37.77063,-122.47915; Giza; Paris | Fitting helps a little; ramps at junctions need their own fit. |
 | 16 | Own tiles built without the sea (osmdata.openstreetmap.de unreachable from here) | coastal tiles | Rebuild when it answers; `build.sh` uses it automatically. |

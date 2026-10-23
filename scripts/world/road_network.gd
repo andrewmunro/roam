@@ -65,7 +65,7 @@ var signal_spots: Array[Vector2] = []  ## centres of signalised junctions (for t
 ## Own edges that need structures (decks, tunnel tubes, cutting walls), whole (junction
 ## surfaces included): {pts, hs (centre line surface), hw, rank, kind, portal: [start, end]}.
 var drawn: Array[Dictionary] = []
-## Carriageway surfaces (and roundabout islands) out of tunnels, as triangles (a, b, c, ...): the ground stays
+## Carriageway surfaces (with pavements and roundabout islands) out of tunnels, as triangles (a, b, c, ...): the ground stays
 ## under these (ChunkBuilder._ground_under_roads, which leaves decks high above alone).
 var ground_tris := PackedVector3Array()
 
@@ -79,6 +79,8 @@ var _rings: Array[Dictionary] = []
 var _clusters: Array[Dictionary] = []
 var _seg_grid := {}  # Vector2i -> Array of edge ids
 var _blocks: UrbanBlocks = null
+var _block_kerbs := {}  # Vector2i cell (BLOCK_KERB_CELL) -> PackedVector2Array of block kerb points
+const BLOCK_KERB_CELL := 4.0
 ## Roads are surfaced by the terrain shader from `road_mask` instead of as meshes:
 ## carriageways, junction and ring surfaces are left out; kerbs, islands and paint stay.
 var mask_mode := false
@@ -1147,7 +1149,7 @@ static func _point_at(pts: PackedVector2Array, dist: PackedFloat32Array, d: floa
 ## lie on another road.
 func _kerb(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Array, skip: int) -> void:
 	# Clearance is checked every third point (it is the slow part); points between
-	# need both checked neighbours clear.
+	# follow them where they agree and are checked themselves where they don't.
 	if pts.size() > 4:
 		# Every other ribbon point is plenty for a kerb.
 		var sp := PackedVector2Array()
@@ -1164,14 +1166,20 @@ func _kerb(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Ar
 	var n := pts.size()
 	var clear: Array[bool] = []
 	clear.resize(n)
+	var is_clear := func(k: int) -> bool:
+		var q := pts[k] + out[k] * (PAVEMENT * 0.75)
+		return not _on_other_road(q, skip) and not _over_cutting(pts[k] + out[k] * (PAVEMENT + 0.5)) \
+			and not (_blocks != null and _blocks.covers(q) and _block_kerbed(pts[k]))  # the block's own kerb is there
 	for k in n:
 		if k % 3 == 0 or k == n - 1:
-			var q := pts[k] + out[k] * (PAVEMENT * 0.75)
-			clear[k] = not _on_other_road(q, skip) and not _over_cutting(pts[k] + out[k] * (PAVEMENT + 0.5)) \
-				and not (_blocks != null and _blocks.covers(q))  # the block's own kerb is there
+			clear[k] = is_clear.call(k)
 	for k in n:
 		if k % 3 != 0 and k != n - 1:
-			clear[k] = clear[k - k % 3] and clear[mini(k - k % 3 + 3, n - 1)]
+			var k0 := k - k % 3
+			var k1 := mini(k0 + 3, n - 1)
+			# Between two checked points that agree, take theirs; where they differ, check
+			# (a kerb stops where it meets something, not a whole step short of it).
+			clear[k] = clear[k0] if clear[k0] == clear[k1] else is_clear.call(k)
 	var run_start := -1
 	for k in n + 1:
 		var ok := k < n and clear[k]
@@ -1181,6 +1189,19 @@ func _kerb(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Ar
 			if k - run_start >= 2:
 				_kerb_run(pts, hs, out, run_start, k)
 			run_start = -1
+
+
+## True if a block's kerb runs along p (its points are ~6 m apart along the block's
+## edge, which lies on the road's edge): the road edge's own kerb isn't needed there.
+## Where a block's edge faces no paved road it has no kerb.
+func _block_kerbed(p: Vector2) -> bool:
+	var c := Vector2i((p / BLOCK_KERB_CELL).floor())
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			for q: Vector2 in _block_kerbs.get(c + Vector2i(dx, dy), PackedVector2Array()):
+				if q.distance_squared_to(p) < 3.5 * 3.5:
+					return true
+	return false
 
 
 func _kerb_run(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVector2Array, i0: int, i1: int) -> void:
@@ -1217,6 +1238,12 @@ func _kerb_run(pts: PackedVector2Array, hs: PackedFloat32Array, out: PackedVecto
 		var off := base + k * 5
 		for q in quads:
 			indices.append(off + q)
+		# The ground stays under the pavement too (ground_tris).
+		var p0 := verts[off + 2]
+		var p1 := verts[off + 3]
+		var p2 := verts[off + 7]
+		var p3 := verts[off + 8]
+		ground_tris.append_array([p0, p1, p3, p0, p3, p2])
 
 
 # --- City blocks ------------------------------------------------------------------------
@@ -1242,6 +1269,9 @@ func _build_blocks() -> void:
 			stats.blocks += 1
 
 
+## Kerbs and paves a block's edge where a paved road runs beside it, and notes where
+## (see _block_kerbed). A block this chunk doesn't own (its centre is in another tile,
+## e.g. a long median) gets no kerb here, so the road edges keep theirs.
 func _block_kerb(poly: PackedVector2Array) -> void:
 	# Points every 6 m or so, enough for the kerb to follow the ground.
 	var pts := PackedVector2Array()
@@ -1267,6 +1297,14 @@ func _block_kerb(poly: PackedVector2Array) -> void:
 		paved.append(road != UrbanBlocks.FREE and road & UrbanBlocks.UNPAVED == 0)
 		ranks.append(rank)
 		hs.append(surface_at(pts[k], rank, RoadLevels.GRADE_BIT, _terrain_top(pts[k])))
+	# Note where the kerb is: paved points in a run of two or more (a lone one draws none).
+	for k in n:
+		if paved[k] and (paved[(k - 1 + n) % n] or paved[(k + 1) % n]):
+			var c := Vector2i((pts[k] / BLOCK_KERB_CELL).floor())
+			if _block_kerbs.has(c):
+				_block_kerbs[c].append(pts[k])
+			else:
+				_block_kerbs[c] = PackedVector2Array([pts[k]])
 	if not mask_mode:
 		_apron(pts, hs, out, ranks, paved)
 	# Start at an unpaved point so no run wraps past the end; all paved: close the ring.

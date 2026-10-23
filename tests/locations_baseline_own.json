@@ -2,97 +2,127 @@
 	"birmingham_aston_expressway": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 8373,
-		"overlap": 620.019740223885,
-		"tilted": 532.925905059593,
+		"lifted": 0.0,
+		"ms": 8563,
+		"overlap": 50.4508852958679,
+		"tilted": 61.6064590601109,
 		"walls": 0.0
 	},
 	"birmingham_spaghetti": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 7499,
-		"overlap": 1318.91168832779,
-		"tilted": 1092.69360304538,
+		"lifted": 0.0,
+		"ms": 7699,
+		"overlap": 332.422247171402,
+		"tilted": 1166.65852371098,
 		"walls": 0.0
 	},
 	"giza_ring_road": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 19488,
-		"overlap": 1964.05517935753,
-		"tilted": 5910.54812751801,
-		"walls": 23.5399216810862
+		"lifted": 290.454134702682,
+		"ms": 19753,
+		"overlap": 1594.43415427208,
+		"tilted": 5128.57290890483,
+		"walls": 0.0
 	},
 	"knaresborough_iles_lane": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 5026,
+		"lifted": 0.0,
+		"ms": 5219,
 		"overlap": 41.34514939785,
-		"tilted": 479.020973143266,
+		"tilted": 452.092476675976,
+		"walls": 0.0
+	},
+	"leeds_armley_gyratory": {
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"lifted": 0.0,
+		"ms": 7513,
+		"overlap": 136.913992881775,
+		"tilted": 247.44665063167,
 		"walls": 0.0
 	},
 	"leeds_onramp": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 11084,
-		"overlap": 75.6340380907059,
-		"tilted": 236.514808671086,
+		"lifted": 0.0,
+		"ms": 10902,
+		"overlap": 102.712099313736,
+		"tilted": 213.893589234219,
 		"walls": 76.3464212417602
 	},
 	"leeds_portal": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 10870,
+		"lifted": 0.0,
+		"ms": 10706,
 		"overlap": 5.6739399433136,
-		"tilted": 27.2064266673274,
+		"tilted": 29.4465370199628,
 		"walls": 20.0974873701731
 	},
 	"london_hyde_park_corner": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 11644,
+		"lifted": 0.0,
+		"ms": 11796,
 		"overlap": 39.1302856206894,
-		"tilted": 12.6654205366558,
+		"tilted": 13.03155822191,
 		"walls": 0.0
 	},
 	"manchester_mancunian_way": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 12562,
+		"lifted": 0.0,
+		"ms": 13038,
 		"overlap": 0.0,
-		"tilted": 11.3057991233184,
-		"walls": 4.78745198249817
+		"tilted": 11.8582856324031,
+		"walls": 0.0
+	},
+	"nyc_lincoln_tunnel": {
+		"buried": 1.59230041503906,
+		"buried_worst": 2.95410187624092,
+		"lifted": 47.3364841938019,
+		"ms": 17374,
+		"overlap": 1271.25947105885,
+		"tilted": 2088.21837719361,
+		"walls": 665.414166212083
 	},
 	"paris_porte_maillot": {
-		"buried": 8.77696990966797,
-		"buried_worst": 2.04852615456073,
-		"ms": 14994,
-		"overlap": 727.463236927986,
-		"tilted": 1170.13207360487,
-		"walls": 363.670813322067
+		"buried": 0.0,
+		"buried_worst": 0.0,
+		"lifted": 0.0,
+		"ms": 15279,
+		"overlap": 309.50429213047,
+		"tilted": 1851.99723081514,
+		"walls": 266.093123356501
 	},
 	"sf_broadway_tunnel": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 15093,
-		"overlap": 825.802484750748,
-		"tilted": 2741.14804219455,
-		"walls": 98.6958577632904
+		"lifted": 0.0,
+		"ms": 15600,
+		"overlap": 996.205309867859,
+		"tilted": 3398.65504674298,
+		"walls": 106.460513035456
 	},
 	"sf_sunset": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 8534,
+		"lifted": 0.0,
+		"ms": 8932,
 		"overlap": 275.838215947151,
-		"tilted": 27.1056457315162,
+		"tilted": 23.1307201122863,
 		"walls": 0.0
 	},
 	"sf_us101": {
 		"buried": 0.0,
 		"buried_worst": 0.0,
-		"ms": 18404,
+		"lifted": 0.0,
+		"ms": 18847,
 		"overlap": 95.9833374023438,
-		"tilted": 107.078095514854,
+		"tilted": 93.7805721398549,
 		"walls": 0.0
 	}
 }
